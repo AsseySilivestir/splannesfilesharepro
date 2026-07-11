@@ -1,0 +1,626 @@
+     1→     1→     1→package com.splannes.filesharepro;
+     2→     2→     2→
+     3→     3→     3→import android.Manifest;
+     4→     4→     4→import android.app.Activity;
+     5→     5→     5→import android.content.ComponentName;
+     6→     6→     6→import android.content.Context;
+     7→     7→     7→import android.content.Intent;
+     8→     8→     8→import android.content.ServiceConnection;
+     9→     9→     9→import android.content.pm.PackageManager;
+    10→    10→    10→import android.net.Uri;
+    11→    11→    11→import android.net.wifi.WifiInfo;
+    12→    12→    12→import android.net.wifi.WifiManager;
+    13→    13→    13→import android.os.Build;
+    14→    14→    14→import android.os.Bundle;
+    15→    15→    15→import android.os.Environment;
+    16→    16→    16→import android.os.IBinder;
+    17→    17→    17→import android.provider.DocumentsContract;
+    18→    18→    18→import android.provider.OpenableColumns;
+    19→    19→    19→import android.provider.Settings;
+    20→    20→    20→import android.text.TextUtils;
+    21→    21→    21→import android.util.Log;
+    22→    22→    22→import android.widget.Button;
+    23→    23→    23→import android.widget.TextView;
+    24→    24→    24→import android.widget.Toast;
+    25→    25→    25→
+    26→    26→    26→import androidx.activity.result.ActivityResultLauncher;
+    27→    27→    27→import androidx.activity.result.contract.ActivityResultContracts;
+    28→    28→    28→import androidx.annotation.NonNull;
+    29→    29→    29→import androidx.appcompat.app.AppCompatActivity;
+    30→    30→    30→import androidx.core.app.ActivityCompat;
+    31→    31→    31→import androidx.core.content.ContextCompat;
+    32→    32→    32→import androidx.recyclerview.widget.LinearLayoutManager;
+    33→    33→    33→import androidx.recyclerview.widget.RecyclerView;
+    34→    34→    34→
+    35→    35→    35→import com.google.android.material.card.MaterialCardView;
+    36→    36→    36→import com.splannes.filesharepro.screen.ScreenShareService;
+    37→    37→    37→import com.splannes.filesharepro.server.FileShareServer;
+    38→    38→    38→import com.splannes.filesharepro.server.FileShareService;
+    39→    39→    39→import com.splannes.filesharepro.ui.TransferLogAdapter;
+    40→    40→    40→
+    41→    41→    41→import java.io.File;
+    42→    42→    42→import java.io.FileInputStream;
+    43→    43→    43→import java.io.FileOutputStream;
+    44→    44→    44→import java.io.InputStream;
+    45→    45→    45→import java.io.OutputStream;
+    46→    46→    46→import java.net.InetAddress;
+    47→    47→    47→import java.net.NetworkInterface;
+    48→    48→    48→import java.util.ArrayList;
+    49→    49→    49→import java.util.Collections;
+    50→    50→    50→import java.util.List;
+    51→    51→    51→import java.util.Timer;
+    52→    52→    52→import java.util.TimerTask;
+    53→    53→    53→import java.util.concurrent.ExecutorService;
+    54→    54→    54→import java.util.concurrent.Executors;
+    55→    55→    55→
+    56→    56→    56→public class MainActivity extends AppCompatActivity {
+    57→    57→    57→
+    58→    58→    58→    private static final String TAG = "MainActivity";
+    59→    59→    59→    private static final int PORT = 8080;
+    60→    60→    60→    private static final int PERM_REQ_GENERAL = 100;
+    61→    61→    61→    private static final int PERM_REQ_SCREEN = 101;
+    62→    62→    62→
+    63→    63→    63→    private Button btnToggleServer;
+    64→    64→    64→    private Button btnShareFiles;
+    65→    65→    65→    private Button btnShareFolder;
+    66→    66→    66→    private Button btnScreenShare;
+    67→    67→    67→    private TextView tvIpAddress;
+    68→    68→    68→    private TextView tvSelectedInfo;
+    69→    69→    69→    private TextView tvConnectedDevices;
+    70→    70→    70→    private TextView statusBadge;
+    71→    71→    71→    private MaterialCardView connectionCard;
+    72→    72→    72→    private MaterialCardView transfersCard;
+    73→    73→    73→    private RecyclerView recyclerTransfers;
+    74→    74→    74→
+    75→    75→    75→    private FileShareService fileShareService;
+    76→    76→    76→    private boolean serverBound = false;
+    77→    77→    77→    private boolean serverRunning = false;
+    78→    78→    78→    private boolean screenSharing = false;
+    79→    79→    79→
+    80→    80→    80→    private TransferLogAdapter transferLogAdapter;
+    81→    81→    81→    private Timer uiUpdateTimer;
+    82→    82→    82→
+    83→    83→    83→    // Background thread for file I/O (prevents ANR / crash)
+    84→    84→    84→    private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
+    85→    85→    85→
+    86→    86→    86→    // --- Result launchers ---
+    87→    87→    87→
+    88→    88→    88→    private final ActivityResultLauncher<Intent> screenCaptureLauncher =
+    89→    89→    89→        registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+    90→    90→    90→            if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+    91→    91→    91→                launchScreenShareService(result.getResultCode(), result.getData());
+    92→    92→    92→            } else {
+    93→    93→    93→                Toast.makeText(this, "Screen sharing permission denied", Toast.LENGTH_SHORT).show();
+    94→    94→    94→            }
+    95→    95→    95→        });
+    96→    96→    96→
+    97→    97→    97→    private final ActivityResultLauncher<Intent> filePickerLauncher =
+    98→    98→    98→        registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+    99→    99→    99→            if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+   100→   100→   100→                handleFilesSelected(result.getData());
+   101→   101→   101→            }
+   102→   102→   102→        });
+   103→   103→   103→
+   104→   104→   104→    private final ActivityResultLauncher<Uri> folderPickerLauncher =
+   105→   105→   105→        registerForActivityResult(new ActivityResultContracts.OpenDocumentTree(), uri -> {
+   106→   106→   106→            if (uri != null) handleFolderSelected(uri);
+   107→   107→   107→        });
+   108→   108→   108→
+   109→   109→   109→    // --- Service connection for FileShareService only ---
+   110→   110→   110→
+   111→   111→   111→    private final ServiceConnection serverConnection = new ServiceConnection() {
+   112→   112→   112→        @Override
+   113→   113→   113→        public void onServiceConnected(ComponentName name, IBinder service) {
+   114→   114→   114→            FileShareService.LocalBinder binder = (FileShareService.LocalBinder) service;
+   115→   115→   115→            fileShareService = binder.getService();
+   116→   116→   116→            serverBound = true;
+   117→   117→   117→            Log.d(TAG, "FileShareService bound");
+   118→   118→   118→        }
+   119→   119→   119→
+   120→   120→   120→        @Override
+   121→   121→   121→        public void onServiceDisconnected(ComponentName name) {
+   122→   122→   122→            serverBound = false;
+   123→   123→   123→            fileShareService = null;
+   124→   124→   124→        }
+   125→   125→   125→    };
+   126→   126→   126→
+   127→   127→   127→    // ===================== Lifecycle =====================
+   128→   128→   128→
+   129→   129→   129→    @Override
+   130→   130→   130→    protected void onCreate(Bundle savedInstanceState) {
+   131→   131→   131→        super.onCreate(savedInstanceState);
+   132→   132→   132→        setContentView(R.layout.activity_main);
+   133→   133→   133→        initViews();
+   134→   134→   134→        requestAllPermissions();
+   135→   135→   135→        startFileShareService();
+   136→   136→   136→    }
+   137→   137→   137→
+   138→   138→   138→    private void initViews() {
+   139→   139→   139→        btnToggleServer = findViewById(R.id.btnToggleServer);
+   140→   140→   140→        btnShareFiles = findViewById(R.id.btnShareFiles);
+   141→   141→   141→        btnShareFolder = findViewById(R.id.btnShareFolder);
+   142→   142→   142→        btnScreenShare = findViewById(R.id.btnScreenShare);
+   143→   143→   143→        tvIpAddress = findViewById(R.id.tvIpAddress);
+   144→   144→   144→        tvSelectedInfo = findViewById(R.id.tvSelectedInfo);
+   145→   145→   145→        tvConnectedDevices = findViewById(R.id.tvConnectedDevices);
+   146→   146→   146→        statusBadge = findViewById(R.id.statusBadge);
+   147→   147→   147→        connectionCard = findViewById(R.id.connectionCard);
+   148→   148→   148→        transfersCard = findViewById(R.id.transfersCard);
+   149→   149→   149→
+   150→   150→   150→        recyclerTransfers = findViewById(R.id.recyclerTransfers);
+   151→   151→   151→        recyclerTransfers.setLayoutManager(new LinearLayoutManager(this));
+   152→   152→   152→        transferLogAdapter = new TransferLogAdapter(this);
+   153→   153→   153→        recyclerTransfers.setAdapter(transferLogAdapter);
+   154→   154→   154→
+   155→   155→   155→        btnToggleServer.setOnClickListener(v -> toggleServer());
+   156→   156→   156→        btnShareFiles.setOnClickListener(v -> openFilePicker());
+   157→   157→   157→        btnShareFolder.setOnClickListener(v -> openFolderPicker());
+   158→   158→   158→        btnScreenShare.setOnClickListener(v -> toggleScreenShare());
+   159→   159→   159→    }
+   160→   160→   160→
+   161→   161→   161→    // ===================== Permissions =====================
+   162→   162→   162→
+   163→   163→   163→    private void requestAllPermissions() {
+   164→   164→   164→        List<String> needed = new ArrayList<>();
+   165→   165→   165→
+   166→   166→   166→        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+   167→   167→   167→            needed.add(Manifest.permission.POST_NOTIFICATIONS);
+   168→   168→   168→        }
+   169→   169→   169→
+   170→   170→   170→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+   171→   171→   171→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED)
+   172→   172→   172→                needed.add(Manifest.permission.READ_MEDIA_IMAGES);
+   173→   173→   173→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED)
+   174→   174→   174→                needed.add(Manifest.permission.READ_MEDIA_VIDEO);
+   175→   175→   175→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED)
+   176→   176→   176→                needed.add(Manifest.permission.READ_MEDIA_AUDIO);
+   177→   177→   177→        } else {
+   178→   178→   178→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+   179→   179→   179→                needed.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+   180→   180→   180→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
+   181→   181→   181→                needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+   182→   182→   182→        }
+   183→   183→   183→
+   184→   184→   184→        if (!needed.isEmpty()) {
+   185→   185→   185→            ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), PERM_REQ_GENERAL);
+   186→   186→   186→        }
+   187→   187→   187→
+   188→   188→   188→        // MANAGE_EXTERNAL_STORAGE for full folder access (Android 11+)
+   189→   189→   189→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+   190→   190→   190→            try {
+   191→   191→   191→                startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+   192→   192→   192→                    Uri.parse("package:" + getPackageName())));
+   193→   193→   193→            } catch (Exception e) {
+   194→   194→   194→                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+   195→   195→   195→            }
+   196→   196→   196→        }
+   197→   197→   197→    }
+   198→   198→   198→
+   199→   199→   199→    @Override
+   200→   200→   200→    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+   201→   201→   201→        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+   202→   202→   202→        if (requestCode == PERM_REQ_SCREEN) {
+   203→   203→   203→            // All screen-share permissions granted → now show the system capture dialog
+   204→   204→   204→            if (allGranted(grantResults)) {
+   205→   205→   205→                showScreenCaptureDialog();
+   206→   206→   206→            } else {
+   207→   207→   207→                Toast.makeText(this, "Screen share permission denied", Toast.LENGTH_SHORT).show();
+   208→   208→   208→            }
+   209→   209→   209→        }
+   210→   210→   210→    }
+   211→   211→   211→
+   212→   212→   212→    private boolean allGranted(int[] results) {
+   213→   213→   213→        for (int r : results) if (r != PackageManager.PERMISSION_GRANTED) return false;
+   214→   214→   214→        return true;
+   215→   215→   215→    }
+   216→   216→   216→
+   217→   217→   217→    // ===================== Server control =====================
+   218→   218→   218→
+   219→   219→   219→    private void startFileShareService() {
+   220→   220→   220→        Intent intent = new Intent(this, FileShareService.class);
+   221→   221→   221→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+   222→   222→   222→            startForegroundService(intent);
+   223→   223→   223→        } else {
+   224→   224→   224→            startService(intent);
+   225→   225→   225→        }
+   226→   226→   226→        bindService(intent, serverConnection, Context.BIND_AUTO_CREATE);
+   227→   227→   227→    }
+   228→   228→   228→
+   229→   229→   229→    private void toggleServer() {
+   230→   230→   230→        if (serverRunning) stopServer();
+   231→   231→   231→        else startServer();
+   232→   232→   232→    }
+   233→   233→   233→
+   234→   234→   234→    private void startServer() {
+   235→   235→   235→        if (!serverBound || fileShareService == null) {
+   236→   236→   236→            Toast.makeText(this, "Service not ready, please wait...", Toast.LENGTH_SHORT).show();
+   237→   237→   237→            return;
+   238→   238→   238→        }
+   239→   239→   239→        boolean started = fileShareService.startServer(PORT);
+   240→   240→   240→        if (started) {
+   241→   241→   241→            serverRunning = true;
+   242→   242→   242→            btnToggleServer.setText(R.string.stop_server);
+   243→   243→   243→            btnToggleServer.setBackgroundColor(getColor(R.color.red));
+   244→   244→   244→            statusBadge.setText(R.string.server_running);
+   245→   245→   245→            statusBadge.setBackgroundColor(getColor(R.color.green));
+   246→   246→   246→            String ip = getLocalIpAddress();
+   247→   247→   247→            tvIpAddress.setText("http://" + ip + ":" + PORT);
+   248→   248→   248→            connectionCard.setVisibility(View.VISIBLE);
+   249→   249→   249→            startUiUpdateTimer();
+   250→   250→   250→            Toast.makeText(this, "Server running at " + ip + ":" + PORT, Toast.LENGTH_LONG).show();
+   251→   251→   251→        } else {
+   252→   252→   252→            Toast.makeText(this, "Failed to start server (port in use?)", Toast.LENGTH_SHORT).show();
+   253→   253→   253→        }
+   254→   254→   254→    }
+   255→   255→   255→
+   256→   256→   256→    private void stopServer() {
+   257→   257→   257→        if (fileShareService != null) fileShareService.stopServer();
+   258→   258→   258→        serverRunning = false;
+   259→   259→   259→        screenSharing = false;
+   260→   260→   260→        btnToggleServer.setText(R.string.start_server);
+   261→   261→   261→        btnToggleServer.setBackgroundColor(getColor(R.color.primary));
+   262→   262→   262→        statusBadge.setText(R.string.server_stopped);
+   263→   263→   263→        statusBadge.setBackgroundColor(getColor(R.color.gray_medium));
+   264→   264→   264→        connectionCard.setVisibility(View.GONE);
+   265→   265→   265→        transfersCard.setVisibility(View.GONE);
+   266→   266→   266→        btnScreenShare.setText(R.string.share_screen);
+   267→   267→   267→        btnScreenShare.setBackgroundColor(getColor(R.color.accent));
+   268→   268→   268→        if (uiUpdateTimer != null) { uiUpdateTimer.cancel(); uiUpdateTimer = null; }
+   269→   269→   269→        Toast.makeText(this, "Server stopped", Toast.LENGTH_SHORT).show();
+   270→   270→   270→    }
+   271→   271→   271→
+   272→   272→   272→    private void startUiUpdateTimer() {
+   273→   273→   273→        if (uiUpdateTimer != null) uiUpdateTimer.cancel();
+   274→   274→   274→        uiUpdateTimer = new Timer();
+   275→   275→   275→        uiUpdateTimer.scheduleAtFixedRate(new TimerTask() {
+   276→   276→   276→            @Override
+   277→   277→   277→            public void run() {
+   278→   278→   278→                runOnUiThread(() -> {
+   279→   279→   279→                    if (fileShareService == null || fileShareService.getServer() == null) return;
+   280→   280→   280→                    FileShareServer server = fileShareService.getServer();
+   281→   281→   281→                    List<String> log = server.getTransferLog();
+   282→   282→   282→                    if (!log.isEmpty()) {
+   283→   283→   283→                        transfersCard.setVisibility(View.VISIBLE);
+   284→   284→   284→                        transferLogAdapter.setItems(log);
+   285→   285→   285→                    }
+   286→   286→   286→                    int fc = server.getSharedFileCount();
+   287→   287→   287→                    int dc = server.getSharedFolderCount();
+   288→   288→   288→                    if (fc > 0 || dc > 0) {
+   289→   289→   289→                        tvConnectedDevices.setText(fc + " file(s) and " + dc + " folder(s) shared");
+   290→   290→   290→                    } else {
+   291→   291→   291→                        tvConnectedDevices.setText(R.string.no_connections);
+   292→   292→   292→                    }
+   293→   293→   293→                });
+   294→   294→   294→            }
+   295→   295→   295→        }, 1000, 3000);
+   296→   296→   296→    }
+   297→   297→   297→
+   298→   298→   298→    // ===================== File sharing (off main thread) =====================
+   299→   299→   299→
+   300→   300→   300→    private void openFilePicker() {
+   301→   301→   301→        if (!serverRunning) {
+   302→   302→   302→            Toast.makeText(this, "Start the server first", Toast.LENGTH_SHORT).show();
+   303→   303→   303→            return;
+   304→   304→   304→        }
+   305→   305→   305→        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+   306→   306→   306→        intent.setType("*/*");
+   307→   307→   307→        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+   308→   308→   308→        intent.addCategory(Intent.CATEGORY_OPENABLE);
+   309→   309→   309→        filePickerLauncher.launch(Intent.createChooser(intent, "Select files to share"));
+   310→   310→   310→    }
+   311→   311→   311→
+   312→   312→   312→    private void handleFilesSelected(Intent data) {
+   313→   313→   313→        List<Uri> uris = new ArrayList<>();
+   314→   314→   314→        if (data.getClipData() != null) {
+   315→   315→   315→            int count = data.getClipData().getItemCount();
+   316→   316→   316→            for (int i = 0; i < count; i++) uris.add(data.getClipData().getItemAt(i).getUri());
+   317→   317→   317→        } else if (data.getData() != null) {
+   318→   318→   318→            uris.add(data.getData());
+   319→   319→   319→        }
+   320→   320→   320→        if (uris.isEmpty()) return;
+   321→   321→   321→
+   322→   322→   322→        Toast.makeText(this, "Copying " + uris.size() + " file(s)...", Toast.LENGTH_SHORT).show();
+   323→   323→   323→
+   324→   324→   324→        // Copy files on background thread to prevent ANR
+   325→   325→   325→        ioExecutor.execute(() -> {
+   326→   326→   326→            File shareDir = new File(getExternalFilesDir(null), "shared");
+   327→   327→   327→            if (!shareDir.exists()) shareDir.mkdirs();
+   328→   328→   328→
+   329→   329→   329→            List<String> copiedPaths = new ArrayList<>();
+   330→   330→   330→            for (Uri uri : uris) {
+   331→   331→   331→                try {
+   332→   332→   332→                    String fileName = getFileName(uri);
+   333→   333→   333→                    if (fileName == null || fileName.isEmpty()) fileName = "file_" + System.currentTimeMillis();
+   334→   334→   334→
+   335→   335→   335→                    File destFile = new File(shareDir, fileName);
+   336→   336→   336→                    int suffix = 1;
+   337→   337→   337→                    while (destFile.exists()) {
+   338→   338→   338→                        String base = fileName.contains(".") ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
+   339→   339→   339→                        String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.')) : "";
+   340→   340→   340→                        destFile = new File(shareDir, base + " (" + suffix + ")" + ext);
+   341→   341→   341→                        suffix++;
+   342→   342→   342→                    }
+   343→   343→   343→
+   344→   344→   344→                    copyUriToFile(uri, destFile);
+   345→   345→   345→                    copiedPaths.add(destFile.getAbsolutePath());
+   346→   346→   346→                } catch (Exception e) {
+   347→   347→   347→                    Log.e(TAG, "Error copying file: " + uri, e);
+   348→   348→   348→                    runOnUiThread(() -> Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+   349→   349→   349→                }
+   350→   350→   350→            }
+   351→   351→   351→
+   352→   352→   352→            // Add to server on the IO thread (server uses thread-safe collections)
+   353→   353→   353→            if (!copiedPaths.isEmpty() && fileShareService != null && fileShareService.getServer() != null) {
+   354→   354→   354→                fileShareService.getServer().addSharedFilePaths(copiedPaths);
+   355→   355→   355→            }
+   356→   356→   356→
+   357→   357→   357→            int count = copiedPaths.size();
+   358→   358→   358→            runOnUiThread(() -> {
+   359→   359→   359→                tvSelectedInfo.setVisibility(View.VISIBLE);
+   360→   360→   360→                tvSelectedInfo.setText(getString(R.string.files_selected, count));
+   361→   361→   361→                if (count > 0) {
+   362→   362→   362→                    Toast.makeText(this, count + " file(s) shared successfully!", Toast.LENGTH_SHORT).show();
+   363→   363→   363→                } else {
+   364→   364→   364→                    Toast.makeText(this, "No files were shared", Toast.LENGTH_SHORT).show();
+   365→   365→   365→                }
+   366→   366→   366→            });
+   367→   367→   367→        });
+   368→   368→   368→    }
+   369→   369→   369→
+   370→   370→   370→    // ===================== Folder sharing (off main thread) =====================
+   371→   371→   371→
+   372→   372→   372→    private void openFolderPicker() {
+   373→   373→   373→        if (!serverRunning) {
+   374→   374→   374→            Toast.makeText(this, "Start the server first", Toast.LENGTH_SHORT).show();
+   375→   375→   375→            return;
+   376→   376→   376→        }
+   377→   377→   377→        folderPickerLauncher.launch(null);
+   378→   378→   378→    }
+   379→   379→   379→
+   380→   380→   380→    private void handleFolderSelected(Uri uri) {
+   381→   381→   381→        Toast.makeText(this, "Copying folder...", Toast.LENGTH_SHORT).show();
+   382→   382→   382→
+   383→   383→   383→        ioExecutor.execute(() -> {
+   384→   384→   384→            try {
+   385→   385→   385→                File shareDir = new File(getExternalFilesDir(null), "shared");
+   386→   386→   386→                if (!shareDir.exists()) shareDir.mkdirs();
+   387→   387→   387→
+   388→   388→   388→                String folderName = getFolderName(uri);
+   389→   389→   389→                File localFolder = new File(shareDir, folderName);
+   390→   390→   390→                if (!localFolder.exists()) localFolder.mkdirs();
+   391→   391→   391→
+   392→   392→   392→                copyFolderFromUri(uri, localFolder);
+   393→   393→   393→
+   394→   394→   394→                if (fileShareService != null && fileShareService.getServer() != null) {
+   395→   395→   395→                    fileShareService.getServer().addSharedFolderPath(localFolder.getAbsolutePath());
+   396→   396→   396→                }
+   397→   397→   397→
+   398→   398→   398→                runOnUiThread(() -> {
+   399→   399→   399→                    tvSelectedInfo.setVisibility(View.VISIBLE);
+   400→   400→   400→                    tvSelectedInfo.setText("Folder shared: " + folderName);
+   401→   401→   401→                    Toast.makeText(this, "Folder shared: " + folderName, Toast.LENGTH_SHORT).show();
+   402→   402→   402→                });
+   403→   403→   403→            } catch (Exception e) {
+   404→   404→   404→                Log.e(TAG, "Error sharing folder", e);
+   405→   405→   405→                runOnUiThread(() -> Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+   406→   406→   406→            }
+   407→   407→   407→        });
+   408→   408→   408→    }
+   409→   409→   409→
+   410→   410→   410→    // ===================== Screen sharing (fixed Android 14 flow) =====================
+   411→   411→   411→
+   412→   412→   412→    /**
+   413→   413→   413→     * Correct Android 14 flow:
+   414→   414→   414→     * 1. Request FOREGROUND_SERVICE_MEDIA_PROJECTION permission
+   415→   415→   415→     * 2. Show system MediaProjection consent dialog
+   416→   416→   416→     * 3. On consent result → start foreground service with result in Intent extras
+   417→   417→   417→     */
+   418→   418→   418→    private void toggleScreenShare() {
+   419→   419→   419→        if (screenSharing) {
+   420→   420→   420→            stopScreenSharing();
+   421→   421→   421→            return;
+   422→   422→   422→        }
+   423→   423→   423→        if (!serverRunning) {
+   424→   424→   424→            Toast.makeText(this, "Start the server first", Toast.LENGTH_SHORT).show();
+   425→   425→   425→            return;
+   426→   426→   426→        }
+   427→   427→   427→
+   428→   428→   428→        // Step 1: Check/request FOREGROUND_SERVICE_MEDIA_PROJECTION
+   429→   429→   429→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+   430→   430→   430→            if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION) != PackageManager.PERMISSION_GRANTED) {
+   431→   431→   431→                ActivityCompat.requestPermissions(this,
+   432→   432→   432→                    new String[]{Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION},
+   433→   433→   433→                    PERM_REQ_SCREEN);
+   434→   434→   434→                return; // result comes back in onRequestPermissionsResult
+   435→   435→   435→            }
+   436→   436→   436→        }
+   437→   437→   437→
+   438→   438→   438→        showScreenCaptureDialog();
+   439→   439→   439→    }
+   440→   440→   440→
+   441→   441→   441→    /** Step 2: Show the system screen capture consent dialog */
+   442→   442→   442→    private void showScreenCaptureDialog() {
+   443→   443→   443→        android.media.projection.MediaProjectionManager pm =
+   444→   444→   444→            (android.media.projection.MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+   445→   445→   445→        screenCaptureLauncher.launch(pm.createScreenCaptureIntent());
+   446→   446→   446→    }
+   447→   447→   447→
+   448→   448→   448→    /** Step 3: User granted consent → start foreground service WITH the result */
+   449→   449→   449→    private void launchScreenShareService(int resultCode, Intent data) {
+   450→   450→   450→        try {
+   451→   451→   451→            Intent serviceIntent = new Intent(this, ScreenShareService.class);
+   452→   452→   452→            serviceIntent.putExtra(ScreenShareService.EXTRA_RESULT_CODE, resultCode);
+   453→   453→   453→            serviceIntent.putExtra("data", data);
+   454→   454→   454→
+   455→   455→   455→            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+   456→   456→   456→                startForegroundService(serviceIntent);
+   457→   457→   457→            } else {
+   458→   458→   458→                startService(serviceIntent);
+   459→   459→   459→            }
+   460→   460→   460→
+   461→   461→   461→            // Connect the screen service to the file server for frame delivery
+   462→   462→   462→            if (fileShareService != null && fileShareService.getServer() != null) {
+   463→   463→   463→                fileShareService.getServer().setScreenSharingActive(true);
+   464→   464→   464→                // Bind briefly to wire up the server reference
+   465→   465→   465→                bindService(new Intent(this, ScreenShareService.class), new ServiceConnection() {
+   466→   466→   466→                    @Override
+   467→   467→   467→                    public void onServiceConnected(ComponentName name, IBinder service) {
+   468→   468→   468→                        ScreenShareService screenSvc = ((ScreenShareService.LocalBinder) service).getService();
+   469→   469→   469→                        screenSvc.setFileShareServer(fileShareService.getServer());
+   470→   470→   470→                        try { unbindService(this); } catch (Exception ignored) {}
+   471→   471→   471→                    }
+   472→   472→   472→                    @Override
+   473→   473→   473→                    public void onServiceDisconnected(ComponentName name) {}
+   474→   474→   474→                }, Context.BIND_AUTO_CREATE);
+   475→   475→   475→            }
+   476→   476→   476→
+   477→   477→   477→            screenSharing = true;
+   478→   478→   478→            btnScreenShare.setText(R.string.stop_sharing_screen);
+   479→   479→   479→            btnScreenShare.setBackgroundColor(getColor(R.color.red));
+   480→   480→   480→            Toast.makeText(this, "Screen sharing started", Toast.LENGTH_SHORT).show();
+   481→   481→   481→
+   482→   482→   482→        } catch (Exception e) {
+   483→   483→   483→            Log.e(TAG, "Failed to start screen share", e);
+   484→   484→   484→            Toast.makeText(this, "Failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+   485→   485→   485→        }
+   486→   486→   486→    }
+   487→   487→   487→
+   488→   488→   488→    private void stopScreenSharing() {
+   489→   489→   489→        try {
+   490→   490→   490→            stopService(new Intent(this, ScreenShareService.class));
+   491→   491→   491→        } catch (Exception ignored) {}
+   492→   492→   492→
+   493→   493→   493→        if (fileShareService != null && fileShareService.getServer() != null) {
+   494→   494→   494→            fileShareService.getServer().setScreenSharingActive(false);
+   495→   495→   495→            fileShareService.getServer().setScreenCaptureCallback(null);
+   496→   496→   496→        }
+   497→   497→   497→
+   498→   498→   498→        screenSharing = false;
+   499→   499→   499→        btnScreenShare.setText(R.string.share_screen);
+   500→   500→   500→        btnScreenShare.setBackgroundColor(getColor(R.color.accent));
+   501→   501→   501→        Toast.makeText(this, "Screen sharing stopped", Toast.LENGTH_SHORT).show();
+   502→   502→   502→    }
+   503→   503→   503→
+   504→   504→   504→    // ===================== Utility methods =====================
+   505→   505→   505→
+   506→   506→   506→    private String getLocalIpAddress() {
+   507→   507→   507→        try {
+   508→   508→   508→            for (NetworkInterface intf : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+   509→   509→   509→                for (InetAddress addr : Collections.list(intf.getInetAddresses())) {
+   510→   510→   510→                    if (!addr.isLoopbackAddress() && addr.getHostAddress().indexOf(':') < 0) {
+   511→   511→   511→                        String ip = addr.getHostAddress();
+   512→   512→   512→                        if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+   513→   513→   513→                            return ip;
+   514→   514→   514→                        }
+   515→   515→   515→                    }
+   516→   516→   516→                }
+   517→   517→   517→            }
+   518→   518→   518→            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+   519→   519→   519→            if (wm != null) {
+   520→   520→   520→                WifiInfo wifiInfo = wm.getConnectionInfo();
+   521→   521→   521→                int ipInt = wifiInfo.getIpAddress();
+   522→   522→   522→                if (ipInt != 0) {
+   523→   523→   523→                    return String.format("%d.%d.%d.%d",
+   524→   524→   524→                        (ipInt & 0xFF), (ipInt >> 8 & 0xFF),
+   525→   525→   525→                        (ipInt >> 16 & 0xFF), (ipInt >> 24 & 0xFF));
+   526→   526→   526→                }
+   527→   527→   527→            }
+   528→   528→   528→        } catch (Exception e) {
+   529→   529→   529→            Log.e(TAG, "Error getting IP", e);
+   530→   530→   530→        }
+   531→   531→   531→        return "0.0.0.0";
+   532→   532→   532→    }
+   533→   533→   533→
+   534→   534→   534→    private String getFileName(Uri uri) {
+   535→   535→   535→        try {
+   536→   536→   536→            if (uri != null && "content".equals(uri.getScheme())) {
+   537→   537→   537→                try (android.database.Cursor cursor = getContentResolver().query(uri,
+   538→   538→   538→                        new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+   539→   539→   539→                    if (cursor != null && cursor.moveToFirst()) {
+   540→   540→   540→                        int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+   541→   541→   541→                        if (idx >= 0) {
+   542→   542→   542→                            String name = cursor.getString(idx);
+   543→   543→   543→                            if (!TextUtils.isEmpty(name)) return name;
+   544→   544→   544→                        }
+   545→   545→   545→                    }
+   546→   546→   546→                }
+   547→   547→   547→            }
+   548→   548→   548→            if (uri != null && uri.getPath() != null) {
+   549→   549→   549→                String path = uri.getPath();
+   550→   550→   550→                int slash = path.lastIndexOf('/');
+   551→   551→   551→                if (slash >= 0) return path.substring(slash + 1);
+   552→   552→   552→            }
+   553→   553→   553→        } catch (Exception e) {
+   554→   554→   554→            Log.e(TAG, "Error getting file name", e);
+   555→   555→   555→        }
+   556→   556→   556→        return "file_" + System.currentTimeMillis();
+   557→   557→   557→    }
+   558→   558→   558→
+   559→   559→   559→    private String getFolderName(Uri uri) {
+   560→   560→   560→        try {
+   561→   561→   561→            String lastPath = uri.getLastPathSegment();
+   562→   562→   562→            if (lastPath != null) {
+   563→   563→   563→                int colonIdx = lastPath.lastIndexOf(':');
+   564→   564→   564→                if (colonIdx >= 0) lastPath = lastPath.substring(colonIdx + 1);
+   565→   565→   565→                if (!TextUtils.isEmpty(lastPath)) return lastPath.replace("/", "_");
+   566→   566→   566→            }
+   567→   567→   567→        } catch (Exception e) {
+   568→   568→   568→            Log.e(TAG, "Error getting folder name", e);
+   569→   569→   569→        }
+   570→   570→   570→        return "shared_folder_" + System.currentTimeMillis();
+   571→   571→   571→    }
+   572→   572→   572→
+   573→   573→   573→    private void copyUriToFile(Uri uri, File destFile) throws Exception {
+   574→   574→   574→        InputStream in = getContentResolver().openInputStream(uri);
+   575→   575→   575→        if (in == null) throw new Exception("Cannot open file");
+   576→   576→   576→        try (OutputStream out = new FileOutputStream(destFile)) {
+   577→   577→   577→            byte[] buf = new byte[8192];
+   578→   578→   578→            int len;
+   579→   579→   579→            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+   580→   580→   580→        } finally {
+   581→   581→   581→            in.close();
+   582→   582→   582→        }
+   583→   583→   583→    }
+   584→   584→   584→
+   585→   585→   585→    private void copyFolderFromUri(Uri treeUri, File destFolder) throws Exception {
+   586→   586→   586→        String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+   587→   587→   587→        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId);
+   588→   588→   588→
+   589→   589→   589→        try (android.database.Cursor cursor = getContentResolver().query(childrenUri,
+   590→   590→   590→                new String[]{
+   591→   591→   591→                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+   592→   592→   592→                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+   593→   593→   593→                    DocumentsContract.Document.COLUMN_MIME_TYPE
+   594→   594→   594→                }, null, null, null)) {
+   595→   595→   595→
+   596→   596→   596→            if (cursor != null) {
+   597→   597→   597→                while (cursor.moveToNext()) {
+   598→   598→   598→                    String docId = cursor.getString(0);
+   599→   599→   599→                    String name = cursor.getString(1);
+   600→   600→   600→                    String mimeType = cursor.getString(2);
+   601→   601→   601→                    Uri docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+   602→   602→   602→                    File outFile = new File(destFolder, name);
+   603→   603→   603→
+   604→   604→   604→                    if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mimeType)) {
+   605→   605→   605→                        outFile.mkdirs();
+   606→   606→   606→                        copyFolderFromUri(docUri, outFile);
+   607→   607→   607→                    } else {
+   608→   608→   608→                        copyUriToFile(docUri, outFile);
+   609→   609→   609→                    }
+   610→   610→   610→                }
+   611→   611→   611→            }
+   612→   612→   612→        }
+   613→   613→   613→    }
+   614→   614→   614→
+   615→   615→   615→    @Override
+   616→   616→   616→    protected void onDestroy() {
+   617→   617→   617→        if (uiUpdateTimer != null) { uiUpdateTimer.cancel(); uiUpdateTimer = null; }
+   618→   618→   618→        if (screenSharing) stopScreenSharing();
+   619→   619→   619→        if (serverRunning) stopServer();
+   620→   620→   620→        if (serverBound) {
+   621→   621→   621→            try { unbindService(serverConnection); } catch (Exception ignored) {}
+   622→   622→   622→        }
+   623→   623→   623→        ioExecutor.shutdownNow();
+   624→   624→   624→        super.onDestroy();
+   625→   625→   625→    }
+   626→   626→   626→}

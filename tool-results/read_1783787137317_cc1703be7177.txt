@@ -1,0 +1,608 @@
+     1→package com.splannes.filesharepro.server;
+     2→
+     3→import android.content.Context;
+     4→import android.net.Uri;
+     5→import android.util.Log;
+     6→
+     7→import java.io.File;
+     8→import java.io.FileInputStream;
+     9→import java.io.FileOutputStream;
+    10→import java.io.IOException;
+    11→import java.io.PipedInputStream;
+    12→import java.io.PipedOutputStream;
+    13→import java.text.SimpleDateFormat;
+    14→import java.util.Date;
+    15→import java.util.Locale;
+    16→import java.util.List;
+    17→import java.util.concurrent.CopyOnWriteArrayList;
+    18→import java.util.zip.ZipEntry;
+    19→import java.util.zip.ZipOutputStream;
+    20→
+    21→import fi.iki.elonen.NanoHTTPD;
+    22→
+    23→public class FileShareServer extends NanoHTTPD {
+    24→
+    25→    private static final String TAG = "FileShareServer";
+    26→    private final Context context;
+    27→    private final File downloadDir;
+    28→
+    29→    // Thread-safe collections — NanoHTTPD serves on its own thread
+    30→    private final List<FileItem> sharedFiles = new CopyOnWriteArrayList<>();
+    31→    private final List<FileItem> sharedFolders = new CopyOnWriteArrayList<>();
+    32→    private final List<String> transferLog = new CopyOnWriteArrayList<>();
+    33→
+    34→    private volatile boolean screenSharingActive = false;
+    35→    private volatile ScreenCaptureCallback screenCaptureCallback;
+    36→
+    37→    // Reusable frame buffer for screen share
+    38→    private volatile byte[] latestScreenFrame;
+    39→    private final Object frameLock = new Object();
+    40→
+    41→    public interface ScreenCaptureCallback {
+    42→        byte[] captureFrame();
+    43→    }
+    44→
+    45→    public FileShareServer(Context context, int port) throws IOException {
+    46→        super(port);
+    47→        this.context = context;
+    48→        this.downloadDir = new File(context.getExternalFilesDir(null), "received");
+    49→        if (!this.downloadDir.exists()) {
+    50→            this.downloadDir.mkdirs();
+    51→        }
+    52→    }
+    53→
+    54→    // ---- Public API (called from main thread) ----
+    55→
+    56→    public void setScreenCaptureCallback(ScreenCaptureCallback callback) {
+    57→        this.screenCaptureCallback = callback;
+    58→    }
+    59→
+    60→    public void setScreenSharingActive(boolean active) {
+    61→        this.screenSharingActive = active;
+    62→    }
+    63→
+    64→    /**
+    65→     * Called from main thread to share files. Accepts absolute file paths directly.
+    66→     */
+    67→    public void addSharedFilePaths(List<String> paths) {
+    68→        for (String path : paths) {
+    69→            try {
+    70→                File file = new File(path);
+    71→                if (file.exists() && file.isFile()) {
+    72→                    sharedFiles.add(new FileItem(file.getName(), path, file.length(), false));
+    73→                    Log.d(TAG, "Shared file: " + file.getName() + " (" + file.length() + " bytes)");
+    74→                } else {
+    75→                    Log.w(TAG, "File not found or not a file: " + path);
+    76→                }
+    77→            } catch (Exception e) {
+    78→                Log.e(TAG, "Error sharing file: " + path, e);
+    79→            }
+    80→        }
+    81→    }
+    82→
+    83→    /** Legacy — kept for compatibility but prefer addSharedFilePaths */
+    84→    public void addSharedFiles(List<Uri> uris) {
+    85→        for (Uri uri : uris) {
+    86→            try {
+    87→                String path = uri.getPath();
+    88→                if (path != null) {
+    89→                    File file = new File(path);
+    90→                    if (file.exists() && file.isFile()) {
+    91→                        sharedFiles.add(new FileItem(file.getName(), path, file.length(), false));
+    92→                    }
+    93→                }
+    94→            } catch (Exception e) {
+    95→                Log.e(TAG, "Error sharing URI: " + uri, e);
+    96→            }
+    97→        }
+    98→    }
+    99→
+   100→    public void addSharedFolderPath(String folderPath) {
+   101→        try {
+   102→            File folder = new File(folderPath);
+   103→            if (folder.exists() && folder.isDirectory()) {
+   104→                sharedFolders.add(new FileItem(folder.getName(), folderPath, getFolderSize(folder), true));
+   105→                Log.d(TAG, "Shared folder: " + folder.getName());
+   106→            } else {
+   107→                Log.w(TAG, "Folder not found: " + folderPath);
+   108→            }
+   109→        } catch (Exception e) {
+   110→            Log.e(TAG, "Error sharing folder: " + folderPath, e);
+   111→        }
+   112→    }
+   113→
+   114→    /**
+   115→     * Push a screen frame from the capture service.
+   116→     * Called from the ImageReader listener thread.
+   117→     */
+   118→    public void pushScreenFrame(byte[] jpegBytes) {
+   119→        synchronized (frameLock) {
+   120→            latestScreenFrame = jpegBytes;
+   121→        }
+   122→    }
+   123→
+   124→    public List<String> getTransferLog() {
+   125→        return java.util.Collections.unmodifiableList(new java.util.ArrayList<>(transferLog));
+   126→    }
+   127→
+   128→    public void clearSharedItems() {
+   129→        sharedFiles.clear();
+   130→        sharedFolders.clear();
+   131→    }
+   132→
+   133→    public int getSharedFileCount() {
+   134→        return sharedFiles.size();
+   135→    }
+   136→
+   137→    public int getSharedFolderCount() {
+   138→        return sharedFolders.size();
+   139→    }
+   140→
+   141→    // ---- HTTP serving (NanoHTTPD thread) ----
+   142→
+   143→    @Override
+   144→    public Response serve(IHTTPSession session) {
+   145→        String uri = session.getUri();
+   146→        Method method = session.getMethod();
+   147→        Log.d(TAG, method + " " + uri);
+   148→
+   149→        if (method == Method.OPTIONS) {
+   150→            return cors(newFixedLengthResponse(Response.Status.OK, MIME_HTML, ""));
+   151→        }
+   152→
+   153→        try {
+   154→            if (uri.equals("/") || uri.equals("/index.html")) {
+   155→                return cors(newFixedLengthResponse(Response.Status.OK, MIME_HTML, buildWebUI()));
+   156→            }
+   157→            switch (uri) {
+   158→                case "/api/files":       return serveFileList();
+   159→                case "/api/folders":     return serveFolderList();
+   160→                case "/api/folder-contents": return serveFolderContents(session);
+   161→                case "/api/upload":      return serveFileUpload(session);
+   162→                case "/screen":          return cors(newFixedLengthResponse(Response.Status.OK, MIME_HTML, buildScreenPage()));
+   163→                case "/api/screen/stream": return serveScreenStream();
+   164→                case "/api/screen/status": return serveScreenStatus();
+   165→                case "/api/transfers":   return serveTransferLog();
+   166→                default:
+   167→                    if (uri.startsWith("/download/file/"))  return serveFileDownload(uri);
+   168→                    if (uri.startsWith("/download/folder/")) return serveFolderDownload(uri);
+   169→                    return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_HTML, "Not Found"));
+   170→            }
+   171→        } catch (Exception e) {
+   172→            Log.e(TAG, "Error serving " + uri, e);
+   173→            return cors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Server error"));
+   174→        }
+   175→    }
+   176→
+   177→    // ---- Endpoint handlers ----
+   178→
+   179→    private Response serveFileList() {
+   180→        StringBuilder json = new StringBuilder("[");
+   181→        int i = 0;
+   182→        for (FileItem f : sharedFiles) {
+   183→            if (i > 0) json.append(",");
+   184→            json.append(String.format(Locale.US, "{\"name\":\"%s\",\"size\":%d,\"id\":%d}",
+   185→                    esc(f.name), f.size, i));
+   186→            i++;
+   187→        }
+   188→        json.append("]");
+   189→        return cors(newFixedLengthResponse(Response.Status.OK, "application/json", json.toString()));
+   190→    }
+   191→
+   192→    private Response serveFolderList() {
+   193→        StringBuilder json = new StringBuilder("[");
+   194→        int i = 0;
+   195→        for (FileItem f : sharedFolders) {
+   196→            if (i > 0) json.append(",");
+   197→            json.append(String.format(Locale.US, "{\"name\":\"%s\",\"size\":%d,\"id\":%d}",
+   198→                    esc(f.name), f.size, i));
+   199→            i++;
+   200→        }
+   201→        json.append("]");
+   202→        return cors(newFixedLengthResponse(Response.Status.OK, "application/json", json.toString()));
+   203→    }
+   204→
+   205→    private Response serveFolderContents(IHTTPSession session) {
+   206→        Map<String, String> params = session.getParms();
+   207→        String idStr = params.get("id");
+   208→        String subPath = params.get("path");
+   209→        int id;
+   210→        try { id = Integer.parseInt(idStr); } catch (Exception e) {
+   211→            return cors(newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"error\":\"invalid id\"}"));
+   212→        }
+   213→        FileItem[] folders = sharedFolders.toArray(new FileItem[0]);
+   214→        if (id < 0 || id >= folders.length) {
+   215→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"error\":\"folder not found\"}"));
+   216→        }
+   217→        File folder = new File(folders[id].path);
+   218→        if (subPath != null && !subPath.isEmpty()) folder = new File(folder, subPath);
+   219→        if (!folder.exists() || !folder.isDirectory()) {
+   220→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"error\":\"not a directory\"}"));
+   221→        }
+   222→        StringBuilder json = new StringBuilder("{\"path\":\"" + esc(subPath != null ? subPath : "") + "\",\"items\":[");
+   223→        File[] files = folder.listFiles();
+   224→        if (files != null) {
+   225→            boolean first = true;
+   226→            for (File file : files) {
+   227→                if (!first) json.append(",");
+   228→                first = false;
+   229→                json.append(String.format(Locale.US, "{\"name\":\"%s\",\"size\":%d,\"isDir\":%b}",
+   230→                        esc(file.getName()), file.length(), file.isDirectory()));
+   231→            }
+   232→        }
+   233→        json.append("]}");
+   234→        return cors(newFixedLengthResponse(Response.Status.OK, "application/json", json.toString()));
+   235→    }
+   236→
+   237→    private Response serveFileDownload(String uri) {
+   238→        String idStr = uri.substring("/download/file/".length());
+   239→        int id;
+   240→        try { id = Integer.parseInt(idStr); } catch (Exception e) {
+   241→            return cors(newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Invalid id"));
+   242→        }
+   243→        FileItem[] files = sharedFiles.toArray(new FileItem[0]);
+   244→        if (id < 0 || id >= files.length) {
+   245→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File not found"));
+   246→        }
+   247→        File file = new File(files[id].path);
+   248→        if (!file.exists()) {
+   249→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File not found"));
+   250→        }
+   251→        logTransfer("Downloaded: " + file.getName());
+   252→        try {
+   253→            FileInputStream fis = new FileInputStream(file);
+   254→            Response r = newChunkedResponse(Response.Status.OK, getMimeType(file.getName()), fis);
+   255→            addCorsHeaders(r);
+   256→            return r;
+   257→        } catch (IOException e) {
+   258→            return cors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Read error"));
+   259→        }
+   260→    }
+   261→
+   262→    private Response serveFolderDownload(String uri) {
+   263→        String idStr = uri.substring("/download/folder/".length());
+   264→        int id;
+   265→        try { id = Integer.parseInt(idStr); } catch (Exception e) {
+   266→            return cors(newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Invalid id"));
+   267→        }
+   268→        FileItem[] folders = sharedFolders.toArray(new FileItem[0]);
+   269→        if (id < 0 || id >= folders.length) {
+   270→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Folder not found"));
+   271→        }
+   272→        File folder = new File(folders[id].path);
+   273→        if (!folder.exists()) {
+   274→            return cors(newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Folder not found"));
+   275→        }
+   276→        try {
+   277→            File zipFile = new File(context.getCacheDir(), "share_" + System.currentTimeMillis() + ".zip");
+   278→            zipFolder(folder, zipFile);
+   279→            logTransfer("Downloaded folder: " + folder.getName());
+   280→            FileInputStream fis = new FileInputStream(zipFile);
+   281→            Response r = newChunkedResponse(Response.Status.OK, "application/zip", fis);
+   282→            addCorsHeaders(r);
+   283→            return r;
+   284→        } catch (Exception e) {
+   285→            Log.e(TAG, "Zip error", e);
+   286→            return cors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Zip error"));
+   287→        }
+   288→    }
+   289→
+   290→    private Response serveFileUpload(IHTTPSession session) {
+   291→        try {
+   292→            Map<String, String> files = new HashMap<>();
+   293→            session.parseBody(files);
+   294→            String tempPath = files.get("file");
+   295→            if (tempPath == null) {
+   296→                return cors(newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"error\":\"no file\"}"));
+   297→            }
+   298→            File tempFile = new File(tempPath);
+   299→            if (!tempFile.exists()) {
+   300→                return cors(newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"error\":\"upload failed\"}"));
+   301→            }
+   302→
+   303→            String originalName = tempFile.getName();
+   304→            // Clean up nanohttpd prefix if present
+   305→            if (originalName.startsWith("nanohttpd-")) {
+   306→                Map<String, String> headers = session.getHeaders();
+   307→                String cd = headers.get("content-disposition");
+   308→                if (cd != null) {
+   309→                    int fi = cd.indexOf("filename=\"");
+   310→                    if (fi >= 0) {
+   311→                        int start = fi + 10;
+   312→                        int end = cd.indexOf("\"", start);
+   313→                        if (end > start) originalName = cd.substring(start, end);
+   314→                    }
+   315→                }
+   316→            }
+   317→
+   318→            File destFile = new File(downloadDir, originalName);
+   319→            int suffix = 1;
+   320→            while (destFile.exists()) {
+   321→                String base = originalName.contains(".") ? originalName.substring(0, originalName.lastIndexOf('.')) : originalName;
+   322→                String ext = originalName.contains(".") ? originalName.substring(originalName.lastIndexOf('.')) : "";
+   323→                destFile = new File(downloadDir, base + " (" + suffix + ")" + ext);
+   324→                suffix++;
+   325→            }
+   326→            copyFile(tempFile, destFile);
+   327→            tempFile.delete();
+   328→            logTransfer("Uploaded: " + originalName + " (" + formatSize(destFile.length()) + ")");
+   329→
+   330→            return cors(newFixedLengthResponse(Response.Status.OK, "application/json",
+   331→                    String.format("{\"success\":true,\"filename\":\"%s\",\"size\":%d}", esc(destFile.getName()), destFile.length())));
+   332→        } catch (Exception e) {
+   333→            Log.e(TAG, "Upload error", e);
+   334→            return cors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+   335→                    "{\"error\":\"" + esc(e.getMessage() != null ? e.getMessage() : "unknown") + "\"}"));
+   336→        }
+   337→    }
+   338→
+   339→    private Response serveScreenStream() {
+   340→        if (!screenSharingActive) {
+   341→            return cors(newFixedLengthResponse(Response.Status.OK, "application/json", "{\"active\":false}"));
+   342→        }
+   343→        try {
+   344→            final PipedInputStream pis = new PipedInputStream(256 * 1024);
+   345→            final PipedOutputStream pos = new PipedOutputStream(pis);
+   346→
+   347→            Thread streamThread = new Thread(() -> {
+   348→                try {
+   349→                    // Send a single initial frame immediately so the browser shows something
+   350→                    byte[] firstFrame;
+   351→                    synchronized (frameLock) { firstFrame = latestScreenFrame; }
+   352→                    if (firstFrame != null) {
+   353→                        writeMjpegFrame(pos, firstFrame);
+   354→                    }
+   355→
+   356→                    while (screenSharingActive && !Thread.currentThread().isInterrupted()) {
+   357→                        byte[] frame;
+   358→                        synchronized (frameLock) { frame = latestScreenFrame; }
+   359→                        if (frame != null && frame.length > 0) {
+   360→                            writeMjpegFrame(pos, frame);
+   361→                        }
+   362→                        Thread.sleep(150);
+   363→                    }
+   364→                } catch (Exception e) {
+   365→                    // Client disconnected or stream ended — normal
+   366→                    Log.d(TAG, "Screen stream ended: " + e.getMessage());
+   367→                } finally {
+   368→                    try { pos.close(); } catch (Exception ignored) {}
+   369→                }
+   370→            }, "ScreenStream");
+   371→            streamThread.setDaemon(true);
+   372→            streamThread.start();
+   373→
+   374→            Response r = newChunkedResponse(Response.Status.OK, "multipart/x-mixed-replace; boundary=frame", pis);
+   375→            r.addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+   376→            addCorsHeaders(r);
+   377→            return r;
+   378→        } catch (IOException e) {
+   379→            return cors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Stream error"));
+   380→        }
+   381→    }
+   382→
+   383→    private void writeMjpegFrame(PipedOutputStream pos, byte[] frame) throws Exception {
+   384→        String header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + frame.length + "\r\n\r\n";
+   385→        pos.write(header.getBytes("UTF-8"));
+   386→        pos.write(frame);
+   387→        pos.write("\r\n".getBytes("UTF-8"));
+   388→        pos.flush();
+   389→    }
+   390→
+   391→    private Response serveScreenStatus() {
+   392→        return cors(newFixedLengthResponse(Response.Status.OK, "application/json",
+   393→                "{\"active\":" + screenSharingActive + "}"));
+   394→    }
+   395→
+   396→    private Response serveTransferLog() {
+   397→        StringBuilder json = new StringBuilder("[");
+   398→        int i = 0;
+   399→        for (String entry : transferLog) {
+   400→            if (i > 0) json.append(",");
+   401→            json.append("\"").append(esc(entry)).append("\"");
+   402→            i++;
+   403→        }
+   404→        json.append("]");
+   405→        return cors(newFixedLengthResponse(Response.Status.OK, "application/json", json.toString()));
+   406→    }
+   407→
+   408→    // ---- Helpers ----
+   409→
+   410→    private Response cors(Response r) { addCorsHeaders(r); return r; }
+   411→
+   412→    private void addCorsHeaders(Response r) {
+   413→        r.addHeader("Access-Control-Allow-Origin", "*");
+   414→        r.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+   415→        r.addHeader("Access-Control-Allow-Headers", "Content-Type");
+   416→    }
+   417→
+   418→    private void logTransfer(String msg) {
+   419→        String entry = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " - " + msg;
+   420→        transferLog.add(0, entry);
+   421→        while (transferLog.size() > 50) transferLog.remove(transferLog.size() - 1);
+   422→    }
+   423→
+   424→    private long getFolderSize(File folder) {
+   425→        long size = 0;
+   426→        File[] files = folder.listFiles();
+   427→        if (files != null) {
+   428→            for (File f : files) {
+   429→                size += f.isDirectory() ? getFolderSize(f) : f.length();
+   430→            }
+   431→        }
+   432→        return size;
+   433→    }
+   434→
+   435→    private void zipFolder(File folder, File zipFile) throws IOException {
+   436→        ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(zipFile));
+   437→        zipRecursive(folder, folder.getName(), zos);
+   438→        zos.close();
+   439→    }
+   440→
+   441→    private void zipRecursive(File file, String entry, ZipOutputStream zos) throws IOException {
+   442→        if (file.isDirectory()) {
+   443→            File[] children = file.listFiles();
+   444→            if (children != null) {
+   445→                for (File child : children) zipRecursive(child, entry + "/" + child.getName(), zos);
+   446→            }
+   447→        } else {
+   448→            zos.putNextEntry(new ZipEntry(entry));
+   449→            FileInputStream fis = new FileInputStream(file);
+   450→            byte[] buf = new byte[8192];
+   451→            int len;
+   452→            while ((len = fis.read(buf)) > 0) zos.write(buf, 0, len);
+   453→            fis.close();
+   454→            zos.closeEntry();
+   455→        }
+   456→    }
+   457→
+   458→    private void copyFile(File src, File dst) throws IOException {
+   459→        FileInputStream fis = new FileInputStream(src);
+   460→        FileOutputStream fos = new FileOutputStream(dst);
+   461→        byte[] buf = new byte[8192];
+   462→        int len;
+   463→        while ((len = fis.read(buf)) > 0) fos.write(buf, 0, len);
+   464→        fos.close();
+   465→        fis.close();
+   466→    }
+   467→
+   468→    private String getMimeType(String name) {
+   469→        String n = name.toLowerCase(Locale.US);
+   470→        if (n.endsWith(".html")) return "text/html";
+   471→        if (n.endsWith(".css")) return "text/css";
+   472→        if (n.endsWith(".js")) return "application/javascript";
+   473→        if (n.endsWith(".json")) return "application/json";
+   474→        if (n.endsWith(".png")) return "image/png";
+   475→        if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+   476→        if (n.endsWith(".gif")) return "image/gif";
+   477→        if (n.endsWith(".mp4")) return "video/mp4";
+   478→        if (n.endsWith(".mp3")) return "audio/mpeg";
+   479→        if (n.endsWith(".pdf")) return "application/pdf";
+   480→        if (n.endsWith(".zip")) return "application/zip";
+   481→        if (n.endsWith(".apk")) return "application/vnd.android.package-archive";
+   482→        if (n.endsWith(".txt")) return "text/plain";
+   483→        return "application/octet-stream";
+   484→    }
+   485→
+   486→    private String formatSize(long bytes) {
+   487→        if (bytes < 1024) return bytes + " B";
+   488→        if (bytes < 1048576) return String.format(Locale.US, "%.1f KB", bytes / 1024.0);
+   489→        if (bytes < 1073741824) return String.format(Locale.US, "%.1f MB", bytes / (1048576.0));
+   490→        return String.format(Locale.US, "%.1f GB", bytes / (1073741824.0));
+   491→    }
+   492→
+   493→    private String esc(String s) {
+   494→        if (s == null) return "";
+   495→        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "");
+   496→    }
+   497→
+   498→    // ---- Web UI (served at /) ----
+   499→
+   500→    private String buildWebUI() {
+   501→        return "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+   502→            + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+   503→            + "<title>Splannes File Share</title>"
+   504→            + "<style>"
+   505→            + "*{margin:0;padding:0;box-sizing:border-box}"
+   506→            + "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e}"
+   507→            + ".hd{background:linear-gradient(135deg,#1565C0,#1976D2);color:#fff;padding:24px 32px;box-shadow:0 2px 12px rgba(0,0,0,.15)}"
+   508→            + ".hd h1{font-size:24px;font-weight:700}.hd p{opacity:.85;margin-top:4px;font-size:14px}"
+   509→            + ".ct{max-width:900px;margin:24px auto;padding:0 16px}"
+   510→            + ".cd{background:#fff;border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}"
+   511→            + ".cd h2{font-size:18px;margin-bottom:16px;color:#1565C0}"
+   512→            + ".fr{display:flex;align-items:center;padding:12px 16px;border-radius:10px;margin-bottom:6px;background:#f8f9fa;transition:background .15s}"
+   513→            + ".fr:hover{background:#e3f2fd}"
+   514→            + ".fi{width:40px;height:40px;border-radius:10px;background:#1976D2;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;margin-right:14px;flex-shrink:0}"
+   515→            + ".fn{flex:1;min-width:0}.fn b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fn small{color:#757575;font-size:12px}"
+   516→            + ".b{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:10px;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:all .15s;text-decoration:none;color:#fff}"
+   517→            + ".b1{background:#1976D2}.b1:hover{background:#1565C0}.b2{background:#FF6D00}.b2:hover{background:#E65100}.b3{background:#4CAF50}.b3:hover{background:#388E3C}.b4{background:#7B1FA2}.b4:hover{background:#6A1B9A}.b5{background:#455A64}"
+   518→            + ".uz{border:2px dashed #BDBDBD;border-radius:12px;padding:40px;text-align:center;color:#757575;cursor:pointer;transition:all .2s}"
+   519→            + ".uz:hover,.uz.dg{border-color:#1976D2;background:#E3F2FD;color:#1565C0}"
+   520→            + ".pg{height:4px;background:#e0e0e0;border-radius:2px;margin-top:12px;overflow:hidden;display:none}.pb{height:100%;background:linear-gradient(90deg,#1976D2,#42A5F5);border-radius:2px;width:0;transition:width .3s}"
+   521→            + ".nv{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}.nv .b{font-size:13px;padding:8px 16px}"
+   522→            + ".em{text-align:center;padding:32px;color:#9E9E9E;font-size:14px}"
+   523→            + ".fo{padding:8px 12px;cursor:pointer;border-radius:8px;margin-bottom:4px;display:flex;align-items:center;gap:8px}.fo:hover{background:#f0f0f0}"
+   524→            + ".bc{font-size:13px;color:#757575;margin-bottom:12px}.bc a{color:#1976D2;text-decoration:none}"
+   525→            + ".tc{display:none}.tc.ac{display:block}"
+   526→            + ".li{padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px;color:#616161}.li:last-child{border-bottom:none}"
+   527→            + "</style></head><body>"
+   528→            + "<div class='hd'><h1>Splannes File Share Pro</h1><p>Share files between your phone and computer</p></div>"
+   529→            + "<div class='ct'><div class='nv'>"
+   530→            + "<button class='b b1' onclick='st(\"files\")'>Files</button>"
+   531→            + "<button class='b b3' onclick='st(\"folders\")'>Folders</button>"
+   532→            + "<button class='b b2' onclick='st(\"upload\")'>Upload to Phone</button>"
+   533→            + "<button class='b b4' onclick='st(\"screen\")'>Screen Share</button>"
+   534→            + "<button class='b b5' onclick='st(\"log\")'>Transfer Log</button>"
+   535→            + "</div>"
+   536→            + "<div id='t-files' class='tc ac'><div class='cd'><h2>Shared Files</h2><div id='fl'></div></div></div>"
+   537→            + "<div id='t-folders' class='tc'><div class='cd'><h2>Shared Folders</h2><div id='drl'></div><div id='drc'></div></div></div>"
+   538→            + "<div id='t-upload' class='tc'><div class='cd'><h2>Upload Files to Phone</h2>"
+   539→            + "<div class='uz' id='dz' onclick='document.getElementById(\"fi\").click()'>"
+   540→            + "<p style='font-size:48px;margin-bottom:12px'>&#128194;</p>"
+   541→            + "<p>Drop files here or click to browse</p>"
+   542→            + "<input type='file' id='fi' multiple style='display:none' onchange='ul(this.files)'>"
+   543→            + "</div><div class='pg' id='pg'><div class='pb' id='pb'></div></div><div id='us'></div></div></div>"
+   544→            + "<div id='t-screen' class='tc'><div class='cd'><h2>Screen Share</h2>"
+   545→            + "<p style='color:#757575;margin-bottom:16px;font-size:14px'>Start screen sharing from the phone app, then view it here.</p>"
+   546→            + "<div id='ss' style='text-align:center;padding:40px;color:#9E9E9E'>Waiting for screen share...</div>"
+   547→            + "<img id='si' style='display:none;width:100%;border-radius:12px;background:#000' />"
+   548→            + "<div style='text-align:center;margin-top:12px'><button class='b b4' id='bf' style='display:none' onclick='document.getElementById(\"si\").requestFullscreen&&document.getElementById(\"si\").requestFullscreen()'>Fullscreen</button></div>"
+   549→            + "</div></div>"
+   550→            + "<div id='t-log' class='tc'><div class='cd'><h2>Transfer Log</h2><div id='ll'></div></div></div>"
+   551→            + "</div>"
+   552→            + "<script>"
+   553→            + "function fs(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(1)+' GB';}"
+   554→            + "function ex(n){var i=n.lastIndexOf('.');return i>=0?n.substring(i+1).toUpperCase().substring(0,4):'FILE';}"
+   555→            + "function st(n){document.querySelectorAll('.tc').forEach(function(t){t.classList.remove('ac')});document.getElementById('t-'+n).classList.add('ac');"
+   556→            + "if(n==='files')lf();if(n==='folders')ld();if(n==='screen')cs();if(n==='log')ll();}"
+   557→            + "function lf(){fetch('/api/files').then(function(r){return r.json()}).then(function(f){var e=document.getElementById('fl');"
+   558→            + "if(!f.length){e.innerHTML='<div class=em>No files shared yet</div>';return;}"
+   559→            + "e.innerHTML=f.map(function(x){return '<div class=fr><div class=fi>'+ex(x.name)+'</div><div class=fn><b>'+x.name+'</b><small>'+fs(x.size)+'</small></div><a class=\"b b1\" href=\"/download/file/'+x.id+'\" download>Download</a></div>';}).join('');}).catch(function(e){console.error(e)});}"
+   560→            + "function ld(){fetch('/api/folders').then(function(r){return r.json()}).then(function(f){var e=document.getElementById('drl');document.getElementById('drc').innerHTML='';"
+   561→            + "if(!f.length){e.innerHTML='<div class=em>No folders shared yet</div>';return;}"
+   562→            + "e.innerHTML=f.map(function(x,i){return '<div class=fr><div class=fi style=\"background:#4CAF50\">DIR</div><div class=fn><b>'+x.name+'</b><small>'+fs(x.size)+'</small></div><a class=\"b b3\" href=\"/download/folder/'+i+'\" download>ZIP</a><button class=\"b b1\" style=\"margin-left:8px\" onclick=\"bf('+i+',\\'\\')\">Browse</button></div>';}).join('');}).catch(function(e){console.error(e)});}"
+   563→            + "function bf(id,p){fetch('/api/folder-contents?id='+id+'&path='+encodeURIComponent(p)).then(function(r){return r.json()}).then(function(d){var e=document.getElementById('drc');"
+   564→            + "var h='<div class=bc><a href=\"#\" onclick=\"bf('+id+',\\'\\');return false\">Root</a>';"
+   565→            + "if(d.path){var ps=d.path.split('/');var a='';ps.forEach(function(x){a+=(a?'/':'')+x;h+=' &gt; <a href=\"#\" onclick=\"bf('+id+',\\''+a.replace(/'/g,\"\\\\'\")+'\\');return false\">'+x+'</a>';});}"
+   566→            + "h+='</div>';if(!d.items.length){e.innerHTML=h+'<div class=em>Empty</div>';return;}"
+   567→            + "e.innerHTML=h+d.items.map(function(x){if(x.isDir)return '<div class=fo onclick=\"bf('+id+',\\''+(d.path?d.path+'/':'')+x.name.replace(/'/g,\"\\\\'\")+'\\')\">&#128193; '+x.name+' <small style=\"color:#9E9E9E\">'+fs(x.size)+'</small></div>';"
+   568→            + "return '<div class=fr><div class=fi style=\"background:#FF6D00\">'+ex(x.name)+'</div><div class=fn><b>'+x.name+'</b><small>'+fs(x.size)+'</small></div></div>';}).join('');}).catch(function(e){console.error(e)});}"
+   569→            + "function ul(files){if(!files.length)return;var fd=new FormData();for(var i=0;i<files.length;i++)fd.append('file',files[i]);"
+   570→            + "var pg=document.getElementById('pg'),pb=document.getElementById('pb'),us=document.getElementById('us');"
+   571→            + "pg.style.display='block';pb.style.width='0%';"
+   572→            + "var x=new XMLHttpRequest();x.open('POST','/api/upload');"
+   573→            + "x.upload.onprogress=function(e){if(e.lengthComputable)pb.style.width=Math.round(e.loaded/e.total*100)+'%';};"
+   574→            + "x.onload=function(){if(x.status===200){var r=JSON.parse(x.responseText);us.innerHTML='<p style=\"color:#4CAF50;margin-top:8px\">Uploaded: '+r.filename+' ('+fs(r.size)+')</p>';setTimeout(function(){pg.style.display='none';},2000);}else{us.innerHTML='<p style=\"color:#F44336;margin-top:8px\">Upload failed</p>';}};"
+   575→            + "x.send(fd);}"
+   576→            + "var dz=document.getElementById('dz');"
+   577→            + "dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('dg');});"
+   578→            + "dz.addEventListener('dragleave',function(){dz.classList.remove('dg');});"
+   579→            + "dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('dg');ul(e.dataTransfer.files);});"
+   580→            + "var sa=false,si=null;"
+   581→            + "function cs(){fetch('/api/screen/status').then(function(r){return r.json()}).then(function(d){if(d.active){if(!sa){sa=true;document.getElementById('ss').style.display='none';var img=document.getElementById('si');img.style.display='block';img.src='/api/screen/stream';document.getElementById('bf').style.display='inline-flex';"
+   582→            + "si=setInterval(function(){fetch('/api/screen/status').then(function(r){return r.json()}).then(function(x){if(!x.active)ss();});},5000);}}}else{ss();}}).catch(function(e){console.error(e)});}"
+   583→            + "function ss(){sa=false;if(si)clearInterval(si);document.getElementById('si').style.display='none';document.getElementById('si').src='';document.getElementById('ss').style.display='block';document.getElementById('ss').textContent='Screen sharing stopped.';document.getElementById('bf').style.display='none';}"
+   584→            + "function ll(){fetch('/api/transfers').then(function(r){return r.json()}).then(function(l){var e=document.getElementById('ll');if(!l.length){e.innerHTML='<div class=em>No transfers yet</div>';return;}"
+   585→            + "e.innerHTML=l.map(function(x){return '<div class=li>'+x+'</div>';}).join('');}).catch(function(e){console.error(e)});}"
+   586→            + "lf();"
+   587→            + "</script></body></html>";
+   588→    }
+   589→
+   590→    private String buildScreenPage() {
+   591→        return "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Screen</title>"
+   592→            + "<style>*{margin:0;padding:0}body{background:#000;display:flex;align-items:center;justify-content:center;height:100vh;overflow:hidden}"
+   593→            + "img{max-width:100%;max-height:100%;object-fit:contain}</style></head>"
+   594→            + "<body><img id='s' src='/api/screen/stream'>"
+   595→            + "<script>setInterval(function(){fetch('/api/screen/status').then(function(r){return r.json()}).then(function(d){if(!d.active)document.getElementById('s').src='';});},3000);</script>"
+   596→            + "</body></html>";
+   597→    }
+   598→
+   599→    public static class FileItem {
+   600→        public final String name;
+   601→        public final String path;
+   602→        public final long size;
+   603→        public final boolean isFolder;
+   604→        public FileItem(String name, String path, long size, boolean isFolder) {
+   605→            this.name = name; this.path = path; this.size = size; this.isFolder = isFolder;
+   606→        }
+   607→    }
+   608→}
