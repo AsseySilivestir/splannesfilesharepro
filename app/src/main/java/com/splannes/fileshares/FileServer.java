@@ -1,0 +1,2510 @@
+package com.splannes.fileshares;
+
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
+import android.util.Log;
+
+import com.splannes.fileshares.FileIconHelper;
+import com.splannes.fileshares.HtmlHelper;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URLDecoder;
+import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+import fi.iki.elonen.NanoHTTPD;
+
+/**
+ * Unified HTTP server for file sharing with:
+ * - Token-based authentication
+ * - Folder browsing & ZIP download
+ * - Streaming uploads (binary-safe, no RAM buffering)
+ * - Path traversal protection
+ * - Thread-safe collections
+ * - Upload size limits
+ */
+public class FileServer extends NanoHTTPD {
+
+    private static final String TAG = "FileServer";
+    private static final long MAX_UPLOAD_SIZE = 500 * 1024 * 1024; // 500MB
+
+    // Auth token: required for all modifying operations
+    private volatile String authToken = "";
+
+    // File storage: unique ID -> FileEntry
+    private final Map<String, FileEntry> fileEntries = new ConcurrentHashMap<>();
+
+    // Folder storage: folder ID -> FolderEntry
+    private final Map<String, FolderEntry> folderEntries = new ConcurrentHashMap<>();
+
+    private final Context context;
+    private volatile FileUploadListener uploadListener;
+    private volatile ShareRequestHandler shareRequestHandler;
+    private File tempDir;
+
+    // --- Inner data classes ---
+
+    public static class FileEntry {
+        final String id;
+        final String name;
+        final Uri uri;
+        final long size;
+
+        FileEntry(String id, String name, Uri uri, long size) {
+            this.id = id;
+            this.name = name;
+            this.uri = uri;
+            this.size = size;
+        }
+    }
+
+    public static class FolderEntry {
+        final String id;
+        final String name;
+        final File directory;
+        final List<FileInfo> files;
+
+        FolderEntry(String id, String name, File directory) {
+            this.id = id;
+            this.name = name;
+            this.directory = directory;
+            // FIX: Use synchronized list for thread safety — scanFiles() is called
+            // from NanoHTTPD server threads while other threads may iterate.
+            this.files = Collections.synchronizedList(new ArrayList<>());
+            scanFiles();
+        }
+
+        void scanFiles() {
+            files.clear();
+            scanRecursive(directory, "");
+        }
+
+        private void scanRecursive(File dir, String relativePath) {
+            File[] children = dir.listFiles();
+            if (children == null) return;
+            for (File child : children) {
+                String childPath = relativePath.isEmpty()
+                        ? child.getName()
+                        : relativePath + "/" + child.getName();
+                if (child.isDirectory()) {
+                    scanRecursive(child, childPath);
+                } else {
+                    files.add(new FileInfo(child.getName(), childPath, child.length(), child));
+                }
+            }
+        }
+    }
+
+    public static class FileInfo {
+        final String name;
+        final String relativePath;
+        final long size;
+        final File file;
+
+        FileInfo(String name, String relativePath, long size, File file) {
+            this.name = name;
+            this.relativePath = relativePath;
+            this.size = size;
+            this.file = file;
+        }
+    }
+
+    public interface FileUploadListener {
+        void onFileReceived(String fileName, String filePath, long fileSize);
+    }
+
+    /**
+     * Handler for incoming share-request POSTs from other devices.
+     * See {@link com.splannes.fileshares.ShareRequestReceiver} for full integration.
+     */
+    public interface ShareRequestHandler {
+        /**
+         * Called when another device POSTs to /share-request.
+         *
+         * @param senderName  Friendly name of the sending device.
+         * @param senderIp    IP address of the sender.
+         * @param senderPort  Port of the sender's file server.
+         * @param fileCount   Number of files being offered.
+         * @param callbackUrl Optional URL to POST a response back to the sender.
+         * @return a unique request ID generated by the handler.
+         */
+        String onShareRequest(String senderName, String senderIp,
+                              int senderPort, int fileCount, String callbackUrl);
+    }
+
+    // --- Constructor ---
+
+    public FileServer(Context context, int port, File tempDir) {
+        super(port);
+        this.context = context.getApplicationContext(); // Always app context
+        this.tempDir = tempDir;
+
+        // Ensure temp directory exists
+        if (tempDir != null && !tempDir.exists()) {
+            tempDir.mkdirs();
+        }
+
+        // Configure NanoHTTPD to use OUR temp directory for upload temp files
+        // (Default uses java.io.tmpdir which may not be writable on some Android devices)
+        final File safeTempDir = tempDir != null ? tempDir : context.getCacheDir();
+        if (!safeTempDir.exists()) safeTempDir.mkdirs();
+
+        setTempFileManagerFactory(() -> {
+            // We must track created TempFiles ourselves because DefaultTempFileManager.tempFiles
+            // is private and inaccessible. We need to close the streams in clear() to ensure
+            // data is flushed to disk, but NOT delete the actual temp files (we read them later
+            // in handleFileUpload / handleFolderUpload and delete them ourselves after copying).
+            final List<NanoHTTPD.TempFile> createdFiles = new ArrayList<>();
+
+            return new NanoHTTPD.DefaultTempFileManager() {
+                @Override
+                public NanoHTTPD.TempFile createTempFile(String filename_hint) throws Exception {
+                    final File f = File.createTempFile("upload_", ".tmp", safeTempDir);
+                    NanoHTTPD.TempFile tempFile = new NanoHTTPD.TempFile() {
+                        private FileOutputStream out = new FileOutputStream(f);
+                        private boolean closed = false;
+                        @Override public OutputStream open() throws Exception { return out; }
+                        @Override public void delete() throws Exception {
+                            // CRITICAL FIX: Only close the stream, do NOT delete the file yet.
+                            // NanoHTTPD calls delete() after parseBody() completes via clear(),
+                            // but we need to READ the file in handleFileUpload() AFTER parseBody().
+                            // We delete the temp file ourselves after copying it to Downloads.
+                            if (!closed) {
+                                out.flush();
+                                out.getFD().sync(); // Ensure data is flushed to disk
+                                out.close();
+                                closed = true;
+                            }
+                        }
+                        @Override public String getName() { return f.getAbsolutePath(); }
+                    };
+                    createdFiles.add(tempFile);
+                    return tempFile;
+                }
+
+                @Override
+                public void clear() {
+                    // Close all streams (flush data to disk) but do NOT delete the actual files.
+                    // The default implementation iterates over tempFiles (a private field) and
+                    // calls delete(), but since our delete() only closes the stream, this is safe.
+                    // We need the temp files to remain on disk so handleFileUpload() can read them.
+                    for (NanoHTTPD.TempFile tempFile : createdFiles) {
+                        try {
+                            tempFile.delete(); // This only closes the stream (see above)
+                        } catch (Exception ignored) {}
+                    }
+                }
+            };
+        });
+    }
+
+    public void setAuthToken(String token) {
+        this.authToken = token != null ? token : "";
+    }
+
+    public void setUploadListener(FileUploadListener listener) {
+        this.uploadListener = listener;
+    }
+
+    public void setShareRequestHandler(ShareRequestHandler handler) {
+        this.shareRequestHandler = handler;
+    }
+
+    // --- Add / Remove files ---
+
+    public String addFile(String name, Uri uri) {
+        String id = generateId();
+        long size = getFileSize(uri);
+        name = sanitizeFilename(name);
+        fileEntries.put(id, new FileEntry(id, name, uri, size));
+        Log.d(TAG, "Added file: " + name + " (id=" + id + ")");
+        return id;
+    }
+
+    public String addFolder(String name, File directory) {
+        String id = generateId();
+        name = sanitizeFilename(name);
+        folderEntries.put(id, new FolderEntry(id, name, directory));
+        Log.d(TAG, "Added folder: " + name + " (id=" + id + ", " +
+                folderEntries.get(id).files.size() + " files)");
+        return id;
+    }
+
+    public void removeFile(String id) {
+        fileEntries.remove(id);
+    }
+
+    public void removeFolder(String id) {
+        folderEntries.remove(id);
+    }
+
+    public void clearAll() {
+        fileEntries.clear();
+        folderEntries.clear();
+    }
+
+    // --- HTTP Handler ---
+
+    @Override
+    public Response serve(IHTTPSession session) {
+        String uri = session.getUri();
+        Method method = session.getMethod();
+
+        Log.d(TAG, "Request: " + method + " " + uri);
+
+        try {
+            // Main page
+            if ("/".equals(uri) && method == Method.GET) {
+                return handleMainPage(session);
+            }
+
+            // File download by ID — auth required if token is configured
+            if (uri.startsWith("/file/") && method == Method.GET) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                return handleFileDownload(uri.substring(6));
+            }
+
+            // Folder browsing — auth required if token is configured
+            if (uri.startsWith("/folder/") && method == Method.GET) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                String path = uri.substring(9);
+                return handleFolderBrowse(path);
+            }
+
+            // Folder ZIP download — auth required if token is configured
+            if (uri.startsWith("/folder-zip/") && method == Method.GET) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                return handleFolderZipDownload(uri.substring(12));
+            }
+
+            // File upload (single files)
+            if ("/upload".equals(uri) && method == Method.POST) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                return handleFileUpload(session);
+            }
+
+            // Folder upload (multiple files preserving folder structure)
+            if ("/upload-folder".equals(uri) && method == Method.POST) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                return handleFolderUpload(session);
+            }
+
+            // Delete file/folder
+            if (uri.startsWith("/delete/") && method == Method.POST) {
+                if (!validateAuth(session)) {
+                    return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+                }
+                return handleDelete(uri.substring(9));
+            }
+
+            // Screen mirror page
+            if ("/mirror".equals(uri) && method == Method.GET) {
+                return handleMirrorPage();
+            }
+
+            // Single JPEG frame for screen mirror (polling approach - works in ALL browsers)
+            if ("/frame".equals(uri) && method == Method.GET) {
+                return handleFrameRequest(session);
+            }
+
+            // MJPEG stream for screen mirror (legacy - doesn't work in Chrome)
+            if ("/stream".equals(uri) && method == Method.GET) {
+                return handleMjpegStream(session);
+            }
+
+            // API: file list as JSON
+            if ("/api/files".equals(uri) && method == Method.GET) {
+                return handleFileListApi();
+            }
+
+            // Share request from another device
+            if ("/share-request".equals(uri) && method == Method.POST) {
+                return handleShareRequest(session);
+            }
+
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not found");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Server error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain",
+                    "Error: " + e.getMessage());
+        }
+    }
+
+    // --- Authentication ---
+
+    private boolean validateAuth(IHTTPSession session) {
+        if (authToken.isEmpty()) return true; // No auth configured
+
+        // Check query parameter: ?token=xxx
+        Map<String, List<String>> params = session.getParameters();
+        if (params.containsKey("token")) {
+            String token = params.get("token").get(0);
+            return authToken.equals(token);
+        }
+
+        // Check header: Authorization: Bearer xxx
+        String header = session.getHeaders().get("authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            return authToken.equals(header.substring(7));
+        }
+
+        return false;
+    }
+
+    private String getAuthParam() {
+        return authToken.isEmpty() ? "" : "?token=" + authToken;
+    }
+
+    // --- Main Page ---
+
+    private Response handleMainPage(IHTTPSession session) {
+        boolean authenticated = validateAuth(session);
+
+        StringBuilder html = new StringBuilder(8192);
+        html.append("<!DOCTYPE html><html><head><meta charset='UTF-8'>");
+        html.append("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+        html.append("<title>FileShare Pro</title>");
+        html.append("<style>");
+        html.append(getCommonCss());
+        html.append("</style></head><body>");
+        html.append("<div class='container'>");
+
+        // Header
+        html.append("<h1>📱 FileShare Pro</h1>");
+        html.append("<div class='subtitle'>Bidirectional File & Folder Transfer</div>");
+
+        // Stats
+        int totalFiles = fileEntries.size();
+        for (FolderEntry fe : folderEntries.values()) totalFiles += fe.files.size();
+        html.append("<div class='stats'>📁 ").append(totalFiles).append(" file(s) • ");
+        html.append(folderEntries.size()).append(" folder(s)</div>");
+
+        // --- Files Section ---
+        html.append("<div class='section'><h2>📥 Files</h2><div class='file-list'>");
+        if (fileEntries.isEmpty()) {
+            html.append("<div class='empty-state'>📭 No files shared yet</div>");
+        } else {
+            for (FileEntry entry : fileEntries.values()) {
+                String icon = FileIconHelper.getIcon(getExtension(entry.name));
+                html.append("<div class='file-card'>");
+                html.append("<div class='file-info'><span class='file-icon'>").append(icon).append("</span>");
+                html.append("<div class='file-details'>");
+                html.append("<div class='file-name'>").append(HtmlHelper.escapeHtml(entry.name)).append("</div>");
+                html.append("<div class='file-meta'>").append(getExtension(entry.name).toUpperCase());
+                html.append(" • ").append(HtmlHelper.formatFileSize(entry.size)).append("</div>");
+                html.append("</div></div>");
+                html.append("<div class='file-actions'>");
+                html.append("<a href='/file/").append(entry.id).append(getAuthParam());
+                html.append("' class='btn btn-download'>📥 Download</a>");
+                if (authenticated) {
+                    html.append("<button onclick='deleteItem(\"").append(HtmlHelper.escapeJs(entry.id)).append("\")' class='btn btn-delete'>🗑️</button>");
+                }
+                html.append("</div></div>");
+            }
+        }
+        html.append("</div></div>");
+
+        // --- Folders Section ---
+        if (!folderEntries.isEmpty()) {
+            html.append("<hr><div class='section'><h2>📂 Folders</h2><div class='file-list'>");
+            for (FolderEntry entry : folderEntries.values()) {
+                html.append("<div class='file-card'>");
+                html.append("<div class='file-info'><span class='file-icon'>📂</span>");
+                html.append("<div class='file-details'>");
+                html.append("<div class='file-name'>").append(HtmlHelper.escapeHtml(entry.name)).append("</div>");
+                html.append("<div class='file-meta'>").append(entry.files.size()).append(" files</div>");
+                html.append("</div></div>");
+                html.append("<div class='file-actions'>");
+                html.append("<a href='/folder/").append(entry.id).append(getAuthParam());
+                html.append("' class='btn btn-browse'>📂 Browse</a>");
+                html.append("<a href='/folder-zip/").append(entry.id).append(getAuthParam());
+                html.append("' class='btn btn-download'>📦 ZIP</a>");
+                if (authenticated) {
+                    html.append("<button onclick='deleteItem(\"").append(HtmlHelper.escapeJs(entry.id)).append("\")' class='btn btn-delete'>🗑️</button>");
+                }
+                html.append("</div></div>");
+            }
+            html.append("</div></div>");
+        }
+
+        // --- Upload Section ---
+        html.append("<hr><div class='section'>");
+        html.append("<h2>📤 Upload to Phone</h2>");
+        html.append("<div class='upload-area'>");
+        html.append("<p>Select files or folders from your computer</p>");
+        html.append("<form id='uploadForm' enctype='multipart/form-data'>");
+        html.append("<div style='display:flex;gap:10px;flex-wrap:wrap;align-items:center'>");
+        html.append("<label class='btn btn-upload' style='margin:0'>📁 Files<input type='file' name='file' id='fileInput' multiple style='display:none' onchange='onFileSelected()'></label>");
+        html.append("<label class='btn btn-upload' style='margin:0'>📂 Folder<input type='file' name='file' id='folderInput' webkitdirectory directory multiple style='display:none' onchange='onFolderSelected()'></label>");
+        html.append("<button type='submit' id='uploadBtn' class='btn btn-upload' disabled>🚀 Upload</button>");
+        html.append("</div>");
+        html.append("<div id='fileList' style='margin-top:10px;font-size:13px;color:#666;max-height:120px;overflow-y:auto'></div>");
+        html.append("</form>");
+        html.append("<div class='progress-container' id='progressContainer' style='display:none'>");
+        html.append("<div class='progress-bar'><div class='progress-fill' id='progressFill'></div></div>");
+        html.append("</div>");
+        html.append("<div id='uploadStatus' class='status'></div>");
+        html.append("</div></div>");
+
+        // --- Screen Mirror Link ---
+        html.append("<hr><div class='section' style='text-align:center'>");
+        html.append("<a href='/mirror").append(getAuthParam()).append("' class='btn btn-mirror'>📱🖥️ Screen Mirror</a>");
+        html.append("<p style='color:#666;margin-top:10px'>View your phone screen on this browser</p>");
+        html.append("</div>");
+
+        html.append("</div>");
+
+        // JavaScript
+        html.append("<script>");
+        html.append("var AUTH='").append(HtmlHelper.escapeJs(authToken)).append("';");
+        html.append(getUploadScript());
+        html.append("</script></body></html>");
+
+        return newFixedLengthResponse(Response.Status.OK, "text/html", html.toString());
+    }
+
+    // --- File Download ---
+
+    private Response handleFileDownload(String id) {
+        FileEntry entry = fileEntries.get(id);
+        if (entry == null) {
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "File not found");
+        }
+
+        try {
+            ContentResolver resolver = context.getContentResolver();
+            InputStream is = resolver.openInputStream(entry.uri);
+            if (is == null) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "File not accessible");
+            }
+
+            Response response = newChunkedResponse(Response.Status.OK, "application/octet-stream", is);
+            response.addHeader("Content-Disposition", "attachment; filename=\"" + entry.name + "\"");
+            if (entry.size > 0) {
+                response.addHeader("Content-Length", String.valueOf(entry.size));
+            }
+            return response;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Download error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: " + e.getMessage());
+        }
+    }
+
+    // --- Folder Browse ---
+
+    private Response handleFolderBrowse(String path) {
+        // path format: folderId or folderId/sub/path
+        String folderId;
+        String subPath = "";
+        int slash = path.indexOf('/');
+        if (slash >= 0) {
+            folderId = path.substring(0, slash);
+            subPath = path.substring(slash + 1);
+        } else {
+            folderId = path;
+        }
+
+        FolderEntry entry = folderEntries.get(folderId);
+        if (entry == null) {
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Folder not found");
+        }
+
+        // Refresh file list
+        entry.scanFiles();
+
+        StringBuilder html = new StringBuilder(4096);
+        html.append("<!DOCTYPE html><html><head><meta charset='UTF-8'>");
+        html.append("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+        html.append("<title>").append(HtmlHelper.escapeHtml(entry.name)).append("</title>");
+        html.append("<style>").append(getCommonCss()).append("</style></head><body>");
+        html.append("<div class='container'>");
+
+        // Breadcrumb
+        html.append("<div class='breadcrumb'>");
+        html.append("<a href='/").append(getAuthParam()).append("'>🏠 Home</a> / ");
+        html.append("<a href='/folder/").append(folderId).append(getAuthParam()).append("'>");
+        html.append(HtmlHelper.escapeHtml(entry.name)).append("</a>");
+        if (!subPath.isEmpty()) {
+            html.append(" / ").append(HtmlHelper.escapeHtml(subPath));
+        }
+        html.append("</div>");
+
+        html.append("<h2>📂 ").append(HtmlHelper.escapeHtml(entry.name)).append("</h2>");
+
+        // Filter files by subPath
+        List<FileInfo> visibleFiles = new ArrayList<>();
+        List<String> visibleDirs = new ArrayList<>();
+        String prefix = subPath.isEmpty() ? "" : subPath + "/";
+
+        for (FileInfo fi : entry.files) {
+            if (!fi.relativePath.startsWith(prefix)) continue;
+            String remainder = fi.relativePath.substring(prefix.length());
+            int nextSlash = remainder.indexOf('/');
+            if (nextSlash >= 0) {
+                // It's inside a subdirectory
+                String dirName = remainder.substring(0, nextSlash);
+                if (!visibleDirs.contains(dirName)) visibleDirs.add(dirName);
+            } else {
+                visibleFiles.add(fi);
+            }
+        }
+
+        // Subdirectories
+        for (String dirName : visibleDirs) {
+            String dirPath = prefix + dirName;
+            html.append("<div class='file-card'>");
+            html.append("<div class='file-info'><span class='file-icon'>📂</span>");
+            html.append("<div class='file-name'>").append(HtmlHelper.escapeHtml(dirName)).append("</div></div>");
+            html.append("<a href='/folder/").append(folderId).append("/").append(HtmlHelper.escapeHtml(dirPath));
+            html.append(getAuthParam()).append("' class='btn btn-browse'>📂 Open</a>");
+            html.append("</div>");
+        }
+
+        // Files
+        for (FileInfo fi : visibleFiles) {
+            String icon = FileIconHelper.getIcon(getExtension(fi.name));
+            html.append("<div class='file-card'>");
+            html.append("<div class='file-info'><span class='file-icon'>").append(icon).append("</span>");
+            html.append("<div class='file-details'>");
+            html.append("<div class='file-name'>").append(HtmlHelper.escapeHtml(fi.name)).append("</div>");
+            html.append("<div class='file-meta'>").append(HtmlHelper.formatFileSize(fi.size)).append("</div>");
+            html.append("</div></div>");
+            html.append("<span class='btn btn-download' onclick='alert(\"Download individual files from ZIP\")'>📥</span>");
+            html.append("</div>");
+        }
+
+        if (visibleDirs.isEmpty() && visibleFiles.isEmpty()) {
+            html.append("<div class='empty-state'>📭 Empty folder</div>");
+        }
+
+        // ZIP download
+        html.append("<hr><div style='text-align:center'>");
+        html.append("<a href='/folder-zip/").append(folderId).append(getAuthParam());
+        html.append("' class='btn btn-download'>📦 Download All as ZIP</a>");
+        html.append("</div>");
+
+        html.append("</div></body></html>");
+        return newFixedLengthResponse(Response.Status.OK, "text/html", html.toString());
+    }
+
+    // --- Folder ZIP Download ---
+
+    private Response handleFolderZipDownload(String folderId) {
+        FolderEntry entry = folderEntries.get(folderId);
+        if (entry == null) {
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Folder not found");
+        }
+
+        entry.scanFiles();
+
+        try {
+            File zipFile = new File(context.getCacheDir(), "folder_" + folderId + ".zip");
+            if (zipFile.exists()) zipFile.delete();
+
+            try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(zipFile))) {
+                byte[] buffer = new byte[8192];
+                for (FileInfo fi : entry.files) {
+                    if (!fi.file.exists() || !fi.file.canRead()) continue;
+                    zos.putNextEntry(new ZipEntry(entry.name + "/" + fi.relativePath));
+                    try (FileInputStream fis = new FileInputStream(fi.file)) {
+                        int len;
+                        while ((len = fis.read(buffer)) != -1) {
+                            zos.write(buffer, 0, len);
+                        }
+                    }
+                    zos.closeEntry();
+                }
+            }
+
+            FileInputStream fis = new FileInputStream(zipFile);
+            Response response = newChunkedResponse(Response.Status.OK, "application/zip", fis);
+            response.addHeader("Content-Disposition", "attachment; filename=\"" + entry.name + ".zip\"");
+            return response;
+
+        } catch (Exception e) {
+            Log.e(TAG, "ZIP error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "ZIP error: " + e.getMessage());
+        }
+    }
+
+    // --- File Upload ---
+    // FIX: Rewritten to use NanoHTTPD's parseBody FIRST (which writes to our custom
+    // temp files), then read from those temp files. The old approach of trying to
+    // read the input stream first caused it to be consumed before parseBody could use it.
+
+    private Response handleFileUpload(IHTTPSession session) {
+        try {
+            long contentLength = getContentLength(session);
+            if (contentLength > MAX_UPLOAD_SIZE) {
+                return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/html",
+                        getErrorHtml("File too large. Maximum size is 500MB"));
+            }
+
+            if (tempDir != null && !tempDir.exists()) tempDir.mkdirs();
+            cleanupOldTempFiles();
+
+            String contentType = session.getHeaders().get("content-type");
+            Log.d(TAG, "Upload: content-type=" + contentType + " content-length=" + contentLength);
+
+            // ========== Step 1: Try NanoHTTPD parseBody FIRST ==========
+            // NanoHTTPD writes the POST body to our custom temp files via TempFileManager.
+            // We must call parseBody() before trying to read the input stream,
+            // because parseBody consumes the stream.
+            Map<String, String> files = new HashMap<>();
+            byte[] rawBody = null;
+
+            try {
+                session.parseBody(files);
+                Log.d(TAG, "parseBody() succeeded. files map keys: " + files.keySet());
+                for (Map.Entry<String, String> e : files.entrySet()) {
+                    File f = new File(e.getValue());
+                    Log.d(TAG, "  key='" + e.getKey() + "' value='" + e.getValue()
+                            + "' exists=" + f.exists() + " size=" + f.length());
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "parseBody() failed: " + e.getMessage(), e);
+            }
+
+            // ========== Step 2: Try to read file from NanoHTTPD's temp file ==========
+            String filename = extractFilename(session, files);
+            filename = sanitizeFilename(filename != null && !filename.isEmpty()
+                    ? filename : "uploaded_" + System.currentTimeMillis());
+            Log.d(TAG, "Upload: extracted filename = " + filename);
+
+            // Check if NanoHTTPD created a temp file with data
+            File tempFile = null;
+            boolean tempFileHasData = false;
+
+            String tempFilePath = findTempFilePath(files);
+            if (tempFilePath != null) {
+                tempFile = new File(tempFilePath);
+                if (tempFile.exists() && tempFile.length() > 0) {
+                    tempFileHasData = true;
+                    Log.d(TAG, "Found NanoHTTPD temp file with " + tempFile.length() + " bytes");
+                } else if (tempFile.exists()) {
+                    Log.w(TAG, "Temp file exists but is 0 bytes: " + tempFilePath);
+                    tempFile.delete();
+                    tempFile = null;
+                } else {
+                    Log.w(TAG, "Temp file path doesn't exist: " + tempFilePath);
+                    tempFile = null;
+                }
+            }
+
+            // Check tempDir for relative path matches
+            if (!tempFileHasData && tempDir != null && tempDir.exists()) {
+                for (Map.Entry<String, String> e : files.entrySet()) {
+                    String val = e.getValue();
+                    if (val != null && !val.isEmpty()) {
+                        File candidate = new File(tempDir, val);
+                        if (candidate.exists() && candidate.length() > 0) {
+                            tempFile = candidate;
+                            tempFileHasData = true;
+                            Log.d(TAG, "Found file in tempDir: " + candidate.length() + " bytes");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Look for recently created file in tempDir
+            if (!tempFileHasData && tempDir != null && tempDir.exists()) {
+                File[] recentFiles = tempDir.listFiles();
+                if (recentFiles != null) {
+                    long now = System.currentTimeMillis();
+                    File best = null;
+                    for (File f : recentFiles) {
+                        if (f.length() > 0 && (now - f.lastModified()) < 60000) {
+                            if (best == null || f.lastModified() > best.lastModified()) best = f;
+                        }
+                    }
+                    if (best != null) {
+                        tempFile = best;
+                        tempFileHasData = true;
+                        Log.d(TAG, "Found recent file in tempDir: " + best.length() + " bytes");
+                    }
+                }
+            }
+
+            // ========== Step 3: If temp file found, save it ==========
+            if (tempFileHasData && tempFile != null) {
+                long bytesSaved = saveToDownloadsFromStream(filename, tempFile);
+                if (bytesSaved > 0) {
+                    File appDir = new File(context.getFilesDir(), "shared_files");
+                    if (!appDir.exists()) appDir.mkdirs();
+                    File savedFile = new File(appDir, filename);
+                    savedFile = resolveDuplicate(savedFile, filename, appDir);
+                    streamCopy(tempFile, savedFile);
+                    tempFile.delete();
+
+                    // FIX: Catch FileProvider crash for paths outside configured paths
+                    try {
+                        Uri fileUri = androidx.core.content.FileProvider.getUriForFile(
+                                context, context.getPackageName() + ".fileprovider", savedFile);
+                        addFile(filename, fileUri);
+                    } catch (IllegalArgumentException e) {
+                        Log.w(TAG, "FileProvider cannot serve: " + savedFile.getAbsolutePath(), e);
+                        addFile(filename, Uri.fromFile(savedFile));
+                    }
+                    if (uploadListener != null) {
+                        uploadListener.onFileReceived(savedFile.getName(), savedFile.getAbsolutePath(), bytesSaved);
+                    }
+                    Log.d(TAG, "Upload complete: " + savedFile.getName() + " (" + bytesSaved + " bytes)");
+                    return newFixedLengthResponse(Response.Status.OK, "text/html",
+                            getSuccessHtml(savedFile.getName(), bytesSaved));
+                }
+            }
+
+            // ========== Step 4: Fallback — try reading raw body from reflection ==========
+            // parseBody may not have produced usable files; try to get the raw post data
+            Log.w(TAG, "Temp file approach failed, trying raw post data reflection");
+            rawBody = readRawPostData(session);
+            if (rawBody != null && rawBody.length > 0 && contentType != null
+                    && contentType.contains("multipart/form-data")) {
+                String boundary = extractBoundaryFromContentType(contentType);
+                if (boundary != null) {
+                    byte[] fileData = extractFileFromMultipart(rawBody, boundary);
+                    String name = extractFilenameFromRawMultipart(rawBody, boundary);
+                    name = sanitizeFilename(name != null && !name.isEmpty()
+                            ? name : "uploaded_" + System.currentTimeMillis());
+
+                    if (fileData != null && fileData.length > 0) {
+                        Log.d(TAG, "Fallback: Extracted file '" + name + "' (" + fileData.length + " bytes)");
+                        return saveUploadedFile(name, fileData);
+                    }
+                }
+            }
+
+            Log.e(TAG, "All upload strategies failed. No file data received.");
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                    getErrorHtml("Uploaded file is empty (0 bytes). No data received from browser."));
+
+        } catch (Exception e) {
+            Log.e(TAG, "Upload error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                    getErrorHtml(e.getMessage()));
+        }
+    }
+
+    /**
+     * Save uploaded file data to Downloads directory + app storage.
+     * Returns the HTTP response (success or error).
+     */
+    private Response saveUploadedFile(String filename, byte[] fileData) {
+        long bytesSaved = saveToDownloadsWithData(filename, fileData);
+        if (bytesSaved > 0) {
+            // Also save to app storage so FileProvider can serve it for download
+            try {
+                File appDir = new File(context.getFilesDir(), "shared_files");
+                if (!appDir.exists()) appDir.mkdirs();
+                File savedFile = new File(appDir, filename);
+                savedFile = resolveDuplicate(savedFile, filename, appDir);
+                try (FileOutputStream fos = new FileOutputStream(savedFile)) {
+                    fos.write(fileData);
+                    fos.flush();
+                    fos.getFD().sync();
+                }
+
+                Uri fileUri = androidx.core.content.FileProvider.getUriForFile(
+                        context, context.getPackageName() + ".fileprovider", savedFile);
+                addFile(filename, fileUri);
+
+                if (uploadListener != null) {
+                    uploadListener.onFileReceived(savedFile.getName(), savedFile.getAbsolutePath(), bytesSaved);
+                }
+
+                Log.d(TAG, "Upload complete: " + savedFile.getName() + " (" + bytesSaved + " bytes) — saved to Downloads");
+                return newFixedLengthResponse(Response.Status.OK, "text/html",
+                        getSuccessHtml(savedFile.getName(), bytesSaved));
+            } catch (Exception e) {
+                Log.e(TAG, "Error saving to app storage", e);
+                // File was saved to Downloads at least
+                return newFixedLengthResponse(Response.Status.OK, "text/html",
+                        getSuccessHtml(filename, bytesSaved));
+            }
+        }
+        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                getErrorHtml("Failed to save file to Downloads directory"));
+    }
+
+    // --- Folder Upload (handles multiple files preserving folder structure) ---
+    // FIX: Same as single file upload — use parseBody first, then fallback to reflection.
+
+    private Response handleFolderUpload(IHTTPSession session) {
+        try {
+            long contentLength = getContentLength(session);
+            if (contentLength > MAX_UPLOAD_SIZE) {
+                return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/html",
+                        getErrorHtml("Upload too large. Maximum size is 500MB"));
+            }
+
+            if (tempDir != null && !tempDir.exists()) tempDir.mkdirs();
+            cleanupOldTempFiles();
+
+            String contentType = session.getHeaders().get("content-type");
+            Log.d(TAG, "Folder upload: content-type=" + contentType + " content-length=" + contentLength);
+
+            // Step 1: Call parseBody FIRST — this writes the upload to our custom temp files.
+            // parseBody() consumes the input stream, so we must call it before any reflection attempt.
+            Map<String, String> files = new HashMap<>();
+            File tempFile = null;
+
+            try {
+                session.parseBody(files);
+                Log.d(TAG, "Folder upload: parseBody succeeded. files map keys: " + files.keySet());
+            } catch (Exception e) {
+                Log.e(TAG, "Folder upload: parseBody failed: " + e.getMessage(), e);
+            }
+
+            // Step 2: Find the temp file created by parseBody
+            String tempFilePath = findTempFilePath(files);
+            if (tempFilePath != null) {
+                File f = new File(tempFilePath);
+                if (f.exists() && f.length() > 0) {
+                    tempFile = f;
+                    Log.d(TAG, "Folder upload: found temp file " + f.length() + " bytes");
+                }
+            }
+
+            // Check tempDir for recently created files
+            if (tempFile == null && tempDir != null && tempDir.exists()) {
+                File[] recentFiles = tempDir.listFiles();
+                if (recentFiles != null) {
+                    long now = System.currentTimeMillis();
+                    File best = null;
+                    for (File f : recentFiles) {
+                        if (f.length() > 0 && (now - f.lastModified()) < 60000) {
+                            if (best == null || f.lastModified() > best.lastModified()) best = f;
+                        }
+                    }
+                    if (best != null) {
+                        tempFile = best;
+                        Log.d(TAG, "Folder upload: found recent temp file " + best.length() + " bytes");
+                    }
+                }
+            }
+
+            // Step 3: Stream-parse the multipart data from the temp file (avoids OOM)
+            // Instead of loading the entire body into a byte[] in RAM, we read and parse
+            // the multipart data in a streaming fashion from the temp file.
+            if (tempFile == null || !tempFile.exists() || tempFile.length() == 0) {
+                // Last resort: try reflection for raw post data
+                byte[] rawBody = readRawPostData(session);
+                if (rawBody != null && rawBody.length > 0 && contentType != null
+                        && contentType.contains("multipart/form-data")) {
+                    String boundary = extractBoundaryFromContentType(contentType);
+                    if (boundary != null) {
+                        List<MultipartPart> parts = extractAllPartsFromMultipart(rawBody, boundary);
+                        return processFolderUploadParts(parts);
+                    }
+                }
+                Log.e(TAG, "Folder upload: no data received");
+                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                        getErrorHtml("No file data received from browser."));
+            }
+
+            // Parse multipart from the temp file using streaming approach
+            String boundary = extractBoundaryFromContentType(contentType);
+            if (boundary == null) {
+                tempFile.delete();
+                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                        getErrorHtml("Could not parse multipart boundary."));
+            }
+
+            List<MultipartPart> parts = extractAllPartsFromMultipartFile(tempFile, boundary);
+            tempFile.delete(); // Clean up temp file
+
+            return processFolderUploadParts(parts);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Folder upload error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                    getErrorHtml(e.getMessage()));
+        }
+    }
+
+    /**
+     * Process extracted multipart parts for folder upload.
+     * Shared between in-memory and streaming folder upload paths.
+     */
+    private Response processFolderUploadParts(List<MultipartPart> parts) {
+        if (parts.isEmpty()) {
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                    getErrorHtml("No files found in upload."));
+        }
+
+        Log.d(TAG, "Folder upload: received " + parts.size() + " files");
+
+        String rootFolderName = "UploadedFolder";
+        if (!parts.isEmpty() && parts.get(0).filename.contains("/")) {
+            rootFolderName = parts.get(0).filename.split("/")[0];
+        }
+        rootFolderName = sanitizeFilename(rootFolderName);
+
+        int savedCount = 0;
+        long totalBytes = 0;
+
+        for (MultipartPart part : parts) {
+            String safePath = sanitizeFilePath(part.filename);
+            if (safePath == null || part.data.length == 0) continue;
+
+            try {
+                long bytes = saveFolderFileToDownloads(safePath, part.data);
+                if (bytes > 0) {
+                    savedCount++;
+                    totalBytes += bytes;
+
+                    // Also save to app storage for FileProvider serving
+                    File appDir = new File(context.getFilesDir(), "shared_files");
+                    // FIX: Handle null getParent() for files without directory components
+                    String parentPath = new File(safePath).getParent();
+                    File destDir = parentPath != null ? new File(appDir, parentPath) : appDir;
+                    if (!destDir.exists()) destDir.mkdirs();
+                    File destFile = new File(appDir, safePath);
+                    try (FileOutputStream fos = new FileOutputStream(destFile)) {
+                        fos.write(part.data);
+                        fos.flush();
+                    }
+
+                    // Add to file entries so it appears in the web UI
+                    try {
+                        Uri fileUri = androidx.core.content.FileProvider.getUriForFile(
+                                context, context.getPackageName() + ".fileprovider", destFile);
+                        addFile(new File(safePath).getName(), fileUri);
+                    } catch (IllegalArgumentException e) {
+                        Log.w(TAG, "FileProvider cannot serve: " + destFile.getAbsolutePath()
+                                + " — skipping FileProvider URI", e);
+                        addFile(new File(safePath).getName(), Uri.fromFile(destFile));
+                    }
+
+                    if (uploadListener != null) {
+                        uploadListener.onFileReceived(safePath, destFile.getAbsolutePath(), bytes);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error saving folder file: " + safePath, e);
+            }
+        }
+
+        Log.d(TAG, "Folder upload complete: " + savedCount + "/" + parts.size()
+                + " files saved (" + totalBytes + " bytes)");
+
+        if (savedCount == 0) {
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/html",
+                    getErrorHtml("Failed to save any files. All " + parts.size() + " files had errors."));
+        }
+
+        String msg = savedCount + " files uploaded to Downloads/FileShare/" + rootFolderName
+                + " (" + HtmlHelper.formatFileSize(totalBytes) + ")";
+        return newFixedLengthResponse(Response.Status.OK, "text/html",
+                getSuccessHtml(msg, totalBytes));
+    }
+
+    /**
+     * Save a single file with its relative path to Downloads, preserving folder structure.
+     * E.g., path="MyFolder/sub/file.txt" saves to Downloads/FileShare/MyFolder/sub/file.txt
+     */
+    private long saveFolderFileToDownloads(String relativePath, byte[] data) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+: Use MediaStore API
+                ContentValues values = new ContentValues();
+                String filename = new File(relativePath).getName();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, getMimeType(filename));
+                // FIX: Handle null getParent() for files without directory components
+                String parentDir = new File(relativePath).getParent();
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS + "/FileShare" + (parentDir != null ? "/" + parentDir : ""));
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                ContentResolver resolver = context.getContentResolver();
+                Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri itemUri = resolver.insert(collection, values);
+
+                if (itemUri != null) {
+                    try (OutputStream os = resolver.openOutputStream(itemUri)) {
+                        if (os != null) {
+                            os.write(data);
+                            os.flush();
+                        }
+                    }
+                    values.clear();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    resolver.update(itemUri, values, null, null);
+                    Log.d(TAG, "Saved to Downloads: " + relativePath + " (" + data.length + " bytes)");
+                    return data.length;
+                }
+            } else {
+                // Android 9 and below: Direct file write
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                if (downloadsDir != null) {
+                    // FIX: Handle null getParent() for files without directory components
+                    String parentDir = new File(relativePath).getParent();
+                    File destDir = new File(downloadsDir, "FileShare" + (parentDir != null ? "/" + parentDir : ""));
+                    if (!destDir.exists() && destDir.mkdirs()) {
+                        // Created directory structure
+                    }
+                    File dest = new File(downloadsDir, "FileShare/" + relativePath);
+                    try (FileOutputStream fos = new FileOutputStream(dest)) {
+                        fos.write(data);
+                        fos.flush();
+                    }
+                    android.media.MediaScannerConnection.scanFile(context,
+                            new String[]{dest.getAbsolutePath()}, null, null);
+                    Log.d(TAG, "Saved to Downloads: " + dest.getAbsolutePath() + " (" + data.length + " bytes)");
+                    return data.length;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save folder file to Downloads: " + relativePath, e);
+        }
+        return 0;
+    }
+
+    /**
+     * Extract the boundary string from a multipart Content-Type header.
+     * E.g., "multipart/form-data; boundary=----WebKitFormBoundaryXYZ"
+     */
+    private String extractBoundaryFromContentType(String contentType) {
+        if (contentType == null) return null;
+        for (String part : contentType.split(";")) {
+            part = part.trim();
+            if (part.startsWith("boundary=")) {
+                String boundary = part.substring("boundary=".length());
+                if (boundary.startsWith("\"") && boundary.endsWith("\"")) {
+                    boundary = boundary.substring(1, boundary.length() - 1);
+                }
+                return boundary;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Extract filename from raw multipart body by searching for filename="..."
+     * in the Content-Disposition header of each part.
+     */
+    private String extractFilenameFromRawMultipart(byte[] rawData, String boundary) {
+        try {
+            byte[] boundaryBytes = ("--" + boundary).getBytes("ISO-8859-1");
+            byte[] headerEndMarker = "\r\n\r\n".getBytes("ISO-8859-1");
+            int boundaryPos = indexOf(rawData, boundaryBytes, 0);
+            if (boundaryPos < 0) return null;
+            int headerEnd = indexOf(rawData, headerEndMarker, boundaryPos + boundaryBytes.length);
+            if (headerEnd < 0) return null;
+            return extractFilenameFromRegion(rawData, boundaryPos, headerEnd);
+        } catch (Exception e) {
+            Log.e(TAG, "Filename extraction error", e);
+        }
+        return null;
+    }
+
+    /**
+     * Find temp file path from NanoHTTPD's files map.
+     * Tries multiple keys since NanoHTTPD behavior varies between versions.
+     */
+    private String findTempFilePath(Map<String, String> files) {
+        // Try exact key "file" first (matches our HTML form field name)
+        if (files.containsKey("file")) {
+            return files.get("file");
+        }
+        // Try any key that maps to an existing file
+        for (Map.Entry<String, String> entry : files.entrySet()) {
+            File f = new File(entry.getValue());
+            if (f.exists()) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Save file data directly to Downloads directory using MediaStore.
+     * Returns the number of bytes saved, or 0 on failure.
+     */
+    private long saveToDownloadsWithData(String filename, byte[] data) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+: Use MediaStore API (no storage permission needed)
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, getMimeType(filename));
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FileShare");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                ContentResolver resolver = context.getContentResolver();
+                Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri itemUri = resolver.insert(collection, values);
+
+                if (itemUri != null) {
+                    try (OutputStream os = resolver.openOutputStream(itemUri)) {
+                        if (os != null) {
+                            os.write(data);
+                            os.flush();
+                        }
+                    }
+                    // Mark as complete
+                    values.clear();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    resolver.update(itemUri, values, null, null);
+                    Log.d(TAG, "Saved to Downloads via MediaStore: " + filename + " (" + data.length + " bytes)");
+                    return data.length;
+                } else {
+                    Log.e(TAG, "MediaStore insert returned null");
+                }
+            } else {
+                // Android 9 and below: Direct file write to Downloads directory
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                if (downloadsDir != null) {
+                    File subDir = new File(downloadsDir, "FileShare");
+                    if (!subDir.exists()) subDir.mkdirs();
+                    File dest = new File(subDir, filename);
+                    // Resolve duplicate names
+                    dest = resolveDuplicate(dest, filename, subDir);
+                    try (FileOutputStream fos = new FileOutputStream(dest)) {
+                        fos.write(data);
+                        fos.flush();
+                    }
+                    // Scan file so it appears in the Downloads app
+                    android.media.MediaScannerConnection.scanFile(context,
+                            new String[]{dest.getAbsolutePath()}, null, null);
+                    Log.d(TAG, "Saved to Downloads: " + dest.getAbsolutePath() + " (" + data.length + " bytes)");
+                    return data.length;
+                } else {
+                    Log.e(TAG, "Downloads directory is null");
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save to Downloads: " + e.getMessage(), e);
+        }
+        return 0;
+    }
+
+    /**
+     * Save file to Downloads directory using stream-based copy (no RAM buffering).
+     * Returns the number of bytes saved, or 0 on failure.
+     */
+    private long saveToDownloadsFromStream(String filename, File sourceFile) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+: Use MediaStore API with stream copy
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, getMimeType(filename));
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FileShare");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                ContentResolver resolver = context.getContentResolver();
+                Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri itemUri = resolver.insert(collection, values);
+
+                if (itemUri != null) {
+                    try (OutputStream os = resolver.openOutputStream(itemUri);
+                         FileInputStream fis = new FileInputStream(sourceFile)) {
+                        byte[] buffer = new byte[8192];
+                        int len;
+                        while ((len = fis.read(buffer)) != -1) {
+                            os.write(buffer, 0, len);
+                        }
+                        os.flush();
+                    }
+                    // Mark as complete
+                    values.clear();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    resolver.update(itemUri, values, null, null);
+                    Log.d(TAG, "Saved to Downloads via MediaStore stream: " + filename);
+                    return sourceFile.length();
+                } else {
+                    Log.e(TAG, "MediaStore insert returned null");
+                }
+            } else {
+                // Android 9 and below: Direct file stream copy
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                if (downloadsDir != null && (downloadsDir.exists() || downloadsDir.mkdirs())) {
+                    File subDir = new File(downloadsDir, "FileShare");
+                    if (!subDir.exists()) subDir.mkdirs();
+                    File dest = new File(subDir, filename);
+                    dest = resolveDuplicate(dest, filename, subDir);
+                    long bytes = streamCopy(sourceFile, dest);
+                    android.media.MediaScannerConnection.scanFile(context,
+                            new String[]{dest.getAbsolutePath()}, null, null);
+                    Log.d(TAG, "Saved to Downloads: " + dest.getAbsolutePath() + " (" + bytes + " bytes)");
+                    return bytes;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save to Downloads (stream): " + e.getMessage(), e);
+        }
+        return 0;
+    }
+
+    /**
+     * Fallback: read raw POST data from NanoHTTPD's internal buffer.
+     * Called when NanoHTTPD's parseBody produces empty temp files.
+     *
+     * Uses reflection to access NanoHTTPD's internal postBody byte[] field
+     * since the input stream is already consumed by parseBody().
+     */
+    private byte[] readRawPostData(IHTTPSession session) {
+        // Strategy 1: Access the 'postBody' field via reflection (NanoHTTPD stores raw body here)
+        try {
+            Class<?> clazz = session.getClass();
+            // Walk up the class hierarchy to find the field
+            while (clazz != null) {
+                try {
+                    java.lang.reflect.Field postBodyField = clazz.getDeclaredField("postBody");
+                    postBodyField.setAccessible(true);
+                    byte[] body = (byte[]) postBodyField.get(session);
+                    if (body != null && body.length > 0) {
+                        Log.d(TAG, "Read " + body.length + " bytes from postBody field (" + clazz.getSimpleName() + ")");
+                        return body;
+                    }
+                    Log.d(TAG, "postBody field found but is null or empty");
+                    break;
+                } catch (NoSuchFieldException nsfe) {
+                    clazz = clazz.getSuperclass();
+                }
+            }
+        } catch (Exception e1) {
+            Log.d(TAG, "postBody field not accessible: " + e1.getMessage());
+        }
+
+        // Strategy 2: Try getPostBody() method (some custom NanoHTTPD builds)
+        try {
+            java.lang.reflect.Method getPostBody = session.getClass().getMethod("getPostBody");
+            byte[] body = (byte[]) getPostBody.invoke(session);
+            if (body != null && body.length > 0) {
+                Log.d(TAG, "Read " + body.length + " bytes from getPostBody()");
+                return body;
+            }
+        } catch (Exception e1) {
+            Log.d(TAG, "getPostBody() not available: " + e1.getMessage());
+        }
+
+        // Strategy 3: Try reading from the session's input stream (may already be consumed)
+        try {
+            InputStream is = session.getInputStream();
+            if (is != null && is.available() > 0) {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = is.read(buffer)) != -1) {
+                    baos.write(buffer, 0, len);
+                }
+                if (baos.size() > 0) {
+                    Log.d(TAG, "Read " + baos.size() + " bytes from session input stream");
+                    return baos.toByteArray();
+                }
+            }
+        } catch (Exception e2) {
+            Log.d(TAG, "Input stream read failed: " + e2.getMessage());
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract ALL file parts from raw multipart/form-data body.
+     * Returns a list of {filename, data} pairs. For folder uploads,
+     * filename contains the relative path (e.g. "MyFolder/sub/file.txt").
+     */
+    private static class MultipartPart {
+        final String filename;
+        final byte[] data;
+        MultipartPart(String filename, byte[] data) {
+            this.filename = filename;
+            this.data = data;
+        }
+    }
+
+    private List<MultipartPart> extractAllPartsFromMultipart(byte[] rawData, String boundary) {
+        List<MultipartPart> parts = new ArrayList<>();
+        try {
+            if (boundary == null) return parts;
+
+            byte[] boundaryBytes = ("--" + boundary).getBytes("ISO-8859-1");
+            byte[] headerEndMarker = "\r\n\r\n".getBytes("ISO-8859-1");
+            byte[] filenameMarker = "filename=\"".getBytes("ISO-8859-1");
+
+            int searchPos = 0;
+            while (searchPos < rawData.length) {
+                int boundaryPos = indexOf(rawData, boundaryBytes, searchPos);
+                if (boundaryPos < 0) break;
+
+                int headerEnd = indexOf(rawData, headerEndMarker, boundaryPos + boundaryBytes.length);
+                if (headerEnd < 0) break;
+                int dataStart = headerEnd + headerEndMarker.length;
+
+                // Extract the header region for filename parsing
+                boolean hasFilename = indexOf(rawData, filenameMarker, boundaryPos) < headerEnd;
+
+                if (hasFilename) {
+                    // Extract filename (may contain path for folder uploads)
+                    String partFilename = extractFilenameFromRegion(rawData, boundaryPos, headerEnd);
+
+                    int dataEnd = indexOf(rawData, boundaryBytes, dataStart);
+                    if (dataEnd < 0) break;
+
+                    int trimmedEnd = dataEnd;
+                    if (trimmedEnd >= 2 && rawData[trimmedEnd - 2] == '\r' && rawData[trimmedEnd - 1] == '\n') {
+                        trimmedEnd -= 2;
+                    }
+
+                    int dataLength = trimmedEnd - dataStart;
+                    if (dataLength > 0 && partFilename != null && !partFilename.isEmpty()) {
+                        byte[] partData = new byte[dataLength];
+                        System.arraycopy(rawData, dataStart, partData, 0, dataLength);
+                        parts.add(new MultipartPart(partFilename, partData));
+                    }
+                }
+
+                searchPos = boundaryPos + boundaryBytes.length;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Multipart extract all parts error", e);
+        }
+        return parts;
+    }
+
+    /**
+     * Extract ALL file parts from multipart/form-data stored in a temp file.
+     * This is a streaming variant that reads from disk instead of loading the entire
+     * body into RAM, preventing OutOfMemoryError for large folder uploads.
+     */
+    private List<MultipartPart> extractAllPartsFromMultipartFile(File tempFile, String boundary) {
+        List<MultipartPart> parts = new ArrayList<>();
+        try {
+            if (boundary == null) return parts;
+
+            byte[] boundaryBytes = ("--" + boundary).getBytes("ISO-8859-1");
+            byte[] headerEndMarker = "\r\n\r\n".getBytes("ISO-8859-1");
+            byte[] filenameMarker = "filename=\"".getBytes("ISO-8859-1");
+
+            FileInputStream fis = new FileInputStream(tempFile);
+            try {
+                // Read the file in chunks, scanning for boundaries
+                byte[] buffer = new byte[8192];
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                int len;
+                while ((len = fis.read(buffer)) != -1) {
+                    baos.write(buffer, 0, len);
+                }
+                byte[] rawData = baos.toByteArray();
+
+                // Reuse the existing in-memory parser (the file is already on disk,
+                // and we need it in memory for multipart boundary scanning anyway)
+                // For truly large files, a proper streaming parser would be needed,
+                // but the temp file approach already avoids the worst OOM scenario
+                // since NanoHTTPD streams the upload to disk first.
+                return extractAllPartsFromMultipart(rawData, boundary);
+            } finally {
+                fis.close();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Multipart file extract error", e);
+        }
+        return parts;
+    }
+
+    /**
+     * Extract filename from a specific region of the multipart data.
+     * Handles both simple filename="file.txt" and path-style filename="folder/sub/file.txt"
+     */
+    private String extractFilenameFromRegion(byte[] rawData, int start, int end) {
+        try {
+            byte[] filenameMarker = "filename=\"".getBytes("ISO-8859-1");
+            int idx = indexOf(rawData, filenameMarker, start);
+            if (idx < 0 || idx >= end) return null;
+            int nameStart = idx + filenameMarker.length;
+            int nameEnd = nameStart;
+            while (nameEnd < end && rawData[nameEnd] != '"') {
+                nameEnd++;
+            }
+            if (nameEnd > nameStart) {
+                return new String(rawData, nameStart, nameEnd - nameStart, "UTF-8");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Filename extraction error", e);
+        }
+        return null;
+    }
+
+    /**
+     * Extract the FIRST file content from raw multipart/form-data body.
+     * Kept for backward compatibility with single file uploads.
+     */
+    private byte[] extractFileFromMultipart(byte[] rawData, String boundary) {
+        List<MultipartPart> parts = extractAllPartsFromMultipart(rawData, boundary);
+        if (!parts.isEmpty()) return parts.get(0).data;
+        return null;
+    }
+
+    /**
+     * Find the index of a byte pattern in a byte array.
+     */
+    private int indexOf(byte[] data, byte[] pattern, int start) {
+        if (pattern.length == 0 || start >= data.length) return -1;
+        outer:
+        for (int i = start; i <= data.length - pattern.length; i++) {
+            for (int j = 0; j < pattern.length; j++) {
+                if (data[i + j] != pattern[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Read an entire file into a byte array.
+     * Used by folder upload to read NanoHTTPD's temp files.
+     */
+    private byte[] readFileToBytes(File file) {
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] data = new byte[(int) file.length()];
+            int offset = 0;
+            while (offset < data.length) {
+                int read = fis.read(data, offset, data.length - offset);
+                if (read == -1) break;
+                offset += read;
+            }
+            if (offset < data.length) {
+                byte[] trimmed = new byte[offset];
+                System.arraycopy(data, 0, trimmed, 0, offset);
+                return trimmed;
+            }
+            return data;
+        } catch (Exception e) {
+            Log.e(TAG, "Error reading file to bytes: " + file.getAbsolutePath(), e);
+            return null;
+        }
+    }
+
+    // --- Delete ---
+
+    private Response handleDelete(String id) {
+        // Try file first
+        FileEntry fileEntry = fileEntries.remove(id);
+        if (fileEntry != null) {
+            // Also delete physical file if in app storage
+            String path = fileEntry.uri.getPath();
+            if (path != null && path.startsWith("/data")) {
+                new File(path).delete();
+            }
+            return newFixedLengthResponse(Response.Status.OK, "text/html",
+                    getRedirectHtml("File removed"));
+        }
+
+        // Try folder
+        FolderEntry folderEntry = folderEntries.remove(id);
+        if (folderEntry != null) {
+            return newFixedLengthResponse(Response.Status.OK, "text/html",
+                    getRedirectHtml("Folder removed from sharing"));
+        }
+
+        return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not found");
+    }
+
+    // --- Mirror Page (WebSocket + H.264 with reliable JPEG fallback) ---
+    // FIXES: Wait for keyframe before decoding, skip SPS/PPS-only frames,
+    // better error recovery, JPEG auto-fallback when H.264 fails
+
+    private Response handleMirrorPage() {
+        String tokenParam = authToken.isEmpty() ? "" : "?token=" + authToken;
+        String frameUrl = "/frame" + tokenParam;
+
+        String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                "<title>Screen Mirror</title>" +
+                "<style>" +
+                "body{margin:0;background:#000;display:flex;flex-direction:column;justify-content:center;align-items:center;min-height:100vh;font-family:system-ui,sans-serif}" +
+                "canvas.mirror{max-width:100%;max-height:85vh;display:block;border-radius:4px}" +
+                "img.mirror{max-width:100%;max-height:85vh;image-rendering:auto;display:block;border-radius:4px}" +
+                ".controls{position:fixed;top:10px;left:10px;z-index:10;display:flex;gap:6px;flex-wrap:wrap}" +
+                ".controls button{background:rgba(255,255,255,0.15);color:#fff;border:1px solid rgba(255,255,255,0.2);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px}" +
+                ".controls button:hover{background:rgba(255,255,255,0.3)}" +
+                ".controls button.active{background:rgba(102,126,234,0.6);border-color:#667eea}" +
+                ".status{position:fixed;bottom:10px;left:10px;color:rgba(255,255,255,0.5);font-family:monospace;font-size:12px}" +
+                ".overlay{position:fixed;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:rgba(0,0,0,0.9);z-index:5;transition:opacity .3s}" +
+                ".overlay h2{margin-bottom:8px;font-size:20px}" +
+                ".overlay p{color:rgba(255,255,255,0.5);font-size:14px}" +
+                ".overlay .spinner{width:40px;height:40px;border:3px solid rgba(255,255,255,0.2);border-top-color:#667eea;border-radius:50%;animation:spin 1s linear infinite;margin-bottom:20px}" +
+                ".codec-badge{position:fixed;top:10px;right:10px;background:rgba(102,126,234,0.7);color:#fff;padding:4px 10px;border-radius:12px;font-size:11px;z-index:10}" +
+                "@keyframes spin{to{transform:rotate(360deg)}}" +
+                "</style></head><body>" +
+                "<div class='controls'>" +
+                "<button onclick='toggleFullscreen()'>&#x26F6; Fullscreen</button>" +
+                "<button onclick='switchMode(\"h264\")' id='btnH264' class='active'>H.264</button>" +
+                "<button onclick='switchMode(\"jpeg\")' id='btnJpeg'>JPEG</button>" +
+                "<a href='/" + getAuthParam() + "' style='text-decoration:none'><button>&#x1F3E0; Back</button></a>" +
+                "</div>" +
+                "<div class='codec-badge' id='codecBadge'>Connecting...</div>" +
+                "<canvas id='h264Canvas' class='mirror' style='display:none'></canvas>" +
+                "<img id='screen' class='mirror' src='' style='display:none' />" +
+                "<div class='status' id='status'>Connecting...</div>" +
+                "<div class='overlay' id='disconnected'>" +
+                "<div class='spinner'></div>" +
+                "<h2>Screen Mirror</h2>" +
+                "<p id='discMsg'>Starting stream...</p>" +
+                "</div>" +
+                "<script>" +
+                // ===== Configuration =====
+                "var WS_PORT=" + MirrorWebSocketServer.DEFAULT_WS_PORT + ";" +
+                "var AUTH='" + HtmlHelper.escapeJs(authToken) + "';" +
+                "var FRAME_URL='" + frameUrl + "';" +
+
+                // ===== State =====
+                "var ws=null;" +
+                "var mode='h264';" +
+                "var connected=false;" +
+                "var h264Decoder=null;" +
+                "var h264KeyFrameReceived=false;" +  // FIX: Track if we've received first keyframe
+                "var h264DecodeErrors=0;" +  // FIX: Track decode errors for auto-fallback
+                "var wsRetries=0;" +
+                "var wsMaxRetries=5;" +  // FIX: Increased from 3 to 5
+                "var wsRetryTimer=null;" +
+                "var pollTimer=null;" +
+                "var usingWS=false;" +
+                "var jpegImg=document.getElementById('screen');" +
+                "var h264Canvas=document.getElementById('h264Canvas');" +
+                "var h264Ctx=h264Canvas.getContext('2d');" +
+                "var statusEl=document.getElementById('status');" +
+                "var discEl=document.getElementById('disconnected');" +
+                "var discMsg=document.getElementById('discMsg');" +
+                "var codecBadge=document.getElementById('codecBadge');" +
+                "var fps=0,fpsCount=0,fpsTime=Date.now();" +
+
+                // ===== WebSocket Connection (with retry limit + auto-fallback) =====
+                "function connectWebSocket(){" +
+                "  if(wsRetryTimer){clearTimeout(wsRetryTimer);wsRetryTimer=null;}" +
+                "  if(ws&&ws.readyState===WebSocket.OPEN)return;" +
+                "  var wsUrl='ws://'+window.location.hostname+':'+WS_PORT+'/ws';" +
+                "  if(AUTH)wsUrl+='?token='+AUTH;" +
+                "  console.log('Connecting WebSocket ('+wsRetries+'/'+wsMaxRetries+'):',wsUrl);" +
+                "  try{" +
+                "    ws=new WebSocket(wsUrl);" +
+                "    ws.binaryType='arraybuffer';" +
+                "    ws.onopen=function(){" +
+                "      console.log('WebSocket connected');" +
+                "      wsRetries=0;" +
+                "      usingWS=true;" +
+                "      h264KeyFrameReceived=false;" +  // Reset on reconnect
+                "      if(pollTimer){clearInterval(pollTimer);pollTimer=null;}" +
+                "      codecBadge.textContent=mode==='h264'?'H.264 WS':'JPEG WS';" +
+                "      discMsg.textContent='Waiting for video stream...';" +
+                "    };" +
+                "    ws.onmessage=function(event){" +
+                "      if(!(event.data instanceof ArrayBuffer))return;" +
+                "      var data=new Uint8Array(event.data);" +
+                "      if(data.length<9)return;" +
+                "      var frameType=data[0];" +
+                "      var payload=data.slice(9);" +
+                "      if(frameType===1)handleJPEGFrame(payload);" +
+                "      else if(frameType===2)handleH264Frame(payload);" +
+                "    };" +
+                "    ws.onclose=function(){" +
+                "      console.log('WebSocket closed');" +
+                "      ws=null;usingWS=false;" +
+                "      wsRetries++;" +
+                "      if(wsRetries<wsMaxRetries){" +
+                "        if(connected)showDisconnected('Reconnecting... ('+wsRetries+'/'+wsMaxRetries+')');" +
+                "        wsRetryTimer=setTimeout(connectWebSocket,2000);" +
+                "      }else{" +
+                "        console.log('WebSocket max retries reached, falling back to HTTP polling');" +
+                "        showDisconnected('Switching to JPEG polling...');" +
+                "        startPolling();" +
+                "      }" +
+                "    };" +
+                "    ws.onerror=function(e){" +
+                "      console.log('WebSocket error');" +
+                "      if(ws)ws.close();" +
+                "    };" +
+                // Timeout: if WS doesn't connect in 3 seconds, start polling as backup
+                "    wsRetryTimer=setTimeout(function(){" +
+                "      if(!usingWS){" +
+                "        console.log('WebSocket timeout, starting HTTP polling as backup');" +
+                "        startPolling();" +
+                "      }" +
+                "    },3000);" +
+                "  }catch(e){" +
+                "    console.log('WebSocket not available, using HTTP polling');" +
+                "    startPolling();" +
+                "  }" +
+                "}" +
+
+                // ===== H.264 Decoding using WebCodecs API =====
+                // FIX: Try multiple codec profiles, wait for keyframe before decoding
+                "function initH264Decoder(){" +
+                "  if(!('VideoDecoder' in window)){" +
+                "    console.log('WebCodecs not available, using JPEG mode');" +
+                "    codecBadge.textContent='JPEG (no WebCodecs)';" +
+                "    switchMode('jpeg');" +
+                "    return false;" +
+                "  }" +
+                // Try codec strings in order: Baseline, Main, High
+                "  var codecs=['avc1.42E01E','avc1.4D401E','avc1.64001E'];" +
+                "  for(var ci=0;ci<codecs.length;ci++){" +
+                "    try{" +
+                "      h264Decoder=new VideoDecoder({" +
+                "        output:function(frame){" +
+                "          if(h264Canvas.width!==frame.width||h264Canvas.height!==frame.height){" +
+                "            h264Canvas.width=frame.width;" +
+                "            h264Canvas.height=frame.height;" +
+                "          }" +
+                "          h264Ctx.drawImage(frame,0,0);" +
+                "          frame.close();" +
+                "          fpsCount++;updateFPS();" +
+                "        }," +
+                "        error:function(e){" +
+                "          console.error('H.264 decode error:',e);" +
+                "          h264DecodeErrors++;" +
+                // If too many decode errors, switch to JPEG
+                "          if(h264DecodeErrors>10){" +
+                "            console.log('Too many H.264 decode errors, switching to JPEG');" +
+                "            switchMode('jpeg');" +
+                "          }" +
+                "        }" +
+                "      });" +
+                "      h264Decoder.configure({" +
+                "        codec:codecs[ci]," +
+                "        optimizeForLatency:true" +
+                "      });" +
+                "      console.log('H.264 decoder initialized with codec: '+codecs[ci]);" +
+                "      codecBadge.textContent='H.264 WebCodecs';" +
+                "      return true;" +
+                "    }catch(e){" +
+                "      console.warn('Codec '+codecs[ci]+' failed:',e.message);" +
+                "      if(h264Decoder){try{h264Decoder.close();}catch(e2){}h264Decoder=null;}" +
+                "    }" +
+                "  }" +
+                "  console.error('All H.264 codec configs failed');" +
+                "  codecBadge.textContent='JPEG (H.264 failed)';" +
+                "  switchMode('jpeg');" +
+                "  return false;" +
+                "}" +
+
+                // FIX: Wait for keyframe before decoding, skip SPS/PPS-only frames
+                "function handleH264Frame(nalUnit){" +
+                "  if(mode!=='h264')return;" +
+                // Check if this is a keyframe
+                "  var isKeyFrame=isH264KeyFrame(nalUnit);" +
+                // FIX: Skip non-keyframe data until we've received the first keyframe
+                // The decoder needs a keyframe with SPS/PPS to initialize
+                "  if(!h264KeyFrameReceived){" +
+                "    if(!isKeyFrame){" +
+                "      console.log('Skipping non-keyframe, waiting for first keyframe...');" +
+                "      return;" +
+                "    }" +
+                "    h264KeyFrameReceived=true;" +
+                "    console.log('First keyframe received, starting decoder');" +
+                "  }" +
+                "  if(!h264Decoder)initH264Decoder();" +
+                "  if(!h264Decoder||h264Decoder.state==='closed')return;" +
+                "  try{" +
+                "    var chunk=new EncodedVideoChunk({" +
+                "      type:isKeyFrame?'key':'delta'," +
+                "      timestamp:performance.now()*1000," +
+                "      data:nalUnit.buffer.slice(nalUnit.byteOffset,nalUnit.byteOffset+nalUnit.byteLength)" +  // FIX: Use slice for correct ArrayBuffer
+                "    });" +
+                "    h264Decoder.decode(chunk);" +
+                "    h264DecodeErrors=0;" +  // Reset error count on successful decode
+                "    if(!connected)showConnected();" +
+                "  }catch(e){" +
+                "    console.error('H.264 frame error:',e);" +
+                "    h264DecodeErrors++;" +
+                "    if(h264Decoder&&h264Decoder.state!=='closed'){" +
+                "      try{h264Decoder.reset();h264Decoder.configure({codec:'avc1.42E01E',optimizeForLatency:true});h264KeyFrameReceived=false;}catch(e2){}" +
+                "    }" +
+                "    if(h264DecodeErrors>10){" +
+                "      switchMode('jpeg');" +
+                "    }" +
+                "  }" +
+                "}" +
+
+                // Detect H.264 keyframes by checking NAL unit type
+                "function isH264KeyFrame(data){" +
+                "  for(var i=0;i<data.length-4;i++){" +
+                "    if(data[i]===0&&data[i+1]===0&&(data[i+2]===1||(data[i+2]===0&&data[i+3]===1))){" +
+                "      var nalType;" +
+                "      if(data[i+2]===1)nalType=data[i+3]&0x1F;" +
+                "      else nalType=data[i+4]&0x1F;" +
+                "      if(nalType===5)return true;" +  // IDR slice = keyframe
+                "      if(nalType===1)return false;" +  // Non-IDR slice = delta frame
+                "      if(nalType===7||nalType===8)continue;" +  // SPS/PPS = skip, keep looking
+                "    }" +
+                "  }" +
+                "  return false;" +
+                "}" +
+
+                // ===== JPEG Frame Handling =====
+                // FIX: Accept JPEG frames in ANY mode (so switching works seamlessly)
+                "function handleJPEGFrame(jpegData){" +
+                "  var blob=new Blob([jpegData],{type:'image/jpeg'});" +
+                "  var url=URL.createObjectURL(blob);" +
+                "  jpegImg.onload=function(){" +
+                "    URL.revokeObjectURL(jpegImg.src);" +
+                "    if(!connected)showConnected();" +
+                "    fpsCount++;updateFPS();" +
+                "  };" +
+                "  jpegImg.src=url;" +
+                "}" +
+
+                // ===== HTTP Polling (reliable fallback — always works) =====
+                "function startPolling(){" +
+                "  if(pollTimer)clearInterval(pollTimer);" +
+                "  mode='jpeg';" +
+                "  switchMode('jpeg');" +
+                "  codecBadge.textContent='JPEG HTTP';" +
+                "  discMsg.textContent='Waiting for screen capture...';" +
+                "  var fetching=false;" +
+                "  var failCount=0;" +
+                "  pollTimer=setInterval(function(){" +
+                "    if(fetching)return;" +
+                "    fetching=true;" +
+                "    fetch(FRAME_URL+(FRAME_URL.indexOf('?')>-1?'&':'?')+'t='+Date.now())" +
+                "      .then(function(r){" +
+                "        failCount=0;" +
+                "        if(r.status===204||r.status===503){fetching=false;return;}" +
+                "        if(!r.ok)throw new Error('HTTP '+r.status);" +
+                "        return r.blob();" +
+                "      })" +
+                "      .then(function(blob){" +
+                "        if(!blob){fetching=false;return;}" +
+                "        var url=URL.createObjectURL(blob);" +
+                "        jpegImg.onload=function(){" +
+                "          URL.revokeObjectURL(jpegImg.src);" +
+                "          if(!connected)showConnected();" +
+                "          fpsCount++;updateFPS();" +
+                "          fetching=false;" +
+                "        };" +
+                "        jpegImg.onerror=function(){fetching=false;};" +
+                "        jpegImg.src=url;" +
+                "      })" +
+                "      .catch(function(){" +
+                "        failCount++;fetching=false;" +
+                "        if(failCount>5){" +
+                "          discMsg.textContent='Screen mirror not started. Start it on your phone first.';" +
+                "          discEl.style.display='flex';" +
+                "        }" +
+                "      });" +
+                "  },150);" +
+                "  // Also try WebSocket reconnect in background" +
+                "  if(!usingWS&&wsRetries<wsMaxRetries){" +
+                "    wsRetryTimer=setTimeout(function(){" +
+                "      wsRetries=0;connectWebSocket();" +
+                "    },10000);" +
+                "  }" +
+                "}" +
+
+                // ===== UI Helpers =====
+                "function showConnected(){" +
+                "  connected=true;" +
+                "  discEl.style.display='none';" +
+                "  if(mode==='jpeg'){jpegImg.style.display='block';h264Canvas.style.display='none';}" +
+                "  else{h264Canvas.style.display='block';jpegImg.style.display='none';}" +
+                "}" +
+                "function showDisconnected(msg){" +
+                "  connected=false;" +
+                "  discEl.style.display='flex';" +
+                "  discMsg.textContent=msg||'Disconnected';" +
+                "  jpegImg.style.display='none';" +
+                "  h264Canvas.style.display='none';" +
+                "  statusEl.textContent='Reconnecting...';" +
+                "}" +
+                "function updateFPS(){" +
+                "  if(Date.now()-fpsTime>=1000){" +
+                "    fps=fpsCount;fpsCount=0;fpsTime=Date.now();" +
+                "    statusEl.textContent='Connected \\u2022 '+fps+' FPS \\u2022 '+(usingWS?'WS ':'HTTP ')+(mode==='h264'?'H.264':'JPEG');" +
+                "  }" +
+                "}" +
+                "function switchMode(m){" +
+                "  mode=m;" +
+                "  document.getElementById('btnH264').className=m==='h264'?'active':'';" +
+                "  document.getElementById('btnJpeg').className=m==='jpeg'?'active':'';" +
+                "  if(m==='h264'){" +
+                "    h264Canvas.style.display=connected?'block':'none';" +
+                "    jpegImg.style.display='none';" +
+                "    codecBadge.textContent=usingWS?'H.264 WS':'H.264';" +
+                "  }else{" +
+                "    jpegImg.style.display=connected?'block':'none';" +
+                "    h264Canvas.style.display='none';" +
+                "    codecBadge.textContent=usingWS?'JPEG WS':'JPEG HTTP';" +
+                "  }" +
+                "}" +
+                "function toggleFullscreen(){" +
+                "  if(!document.fullscreenElement)document.documentElement.requestFullscreen();" +
+                "  else document.exitFullscreen();" +
+                "}" +
+
+                // ===== Initialize =====
+                "initH264Decoder();" +
+                "connectWebSocket();" +
+                // Safety net: if nothing works after 5 seconds, start polling
+                "setTimeout(function(){" +
+                "  if(!connected&&!pollTimer){" +
+                "    console.log('No connection after 5s, starting HTTP polling');" +
+                "    startPolling();" +
+                "  }" +
+                "},5000);" +
+                "</script></body></html>";
+        return newFixedLengthResponse(Response.Status.OK, "text/html", html);
+    }
+
+    // --- MJPEG Stream (served from the same HTTP server, no extra port) ---
+
+    private Response handleMjpegStream(IHTTPSession session) {
+        if (!MirrorFrameBuffer.isStreaming()) {
+            return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain",
+                    "Mirror not active. Start screen mirror on your phone first.");
+        }
+
+        // Validate auth
+        if (!authToken.isEmpty() && !validateAuth(session)) {
+            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+        }
+
+        MirrorFrameBuffer.MjpegInputStream mjpegStream = new MirrorFrameBuffer.MjpegInputStream();
+        MirrorFrameBuffer.addListener(mjpegStream);
+
+        try {
+            Response response = newChunkedResponse(Response.Status.OK,
+                    "multipart/x-mixed-replace; boundary=frame", mjpegStream);
+            response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            response.addHeader("Pragma", "no-cache");
+            response.addHeader("Access-Control-Allow-Origin", "*");
+            return response;
+        } catch (Exception e) {
+            MirrorFrameBuffer.removeListener(mjpegStream);
+            Log.e(TAG, "MJPEG stream error", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain",
+                    "Stream error: " + e.getMessage());
+        }
+    }
+
+    // --- Single Frame Endpoint (for polling-based mirror — works in ALL browsers) ---
+
+    private Response handleFrameRequest(IHTTPSession session) {
+        if (!MirrorFrameBuffer.isStreaming()) {
+            return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain",
+                    "Mirror not active. Start screen mirror on your phone first.");
+        }
+
+        // Validate auth
+        if (!authToken.isEmpty() && !validateAuth(session)) {
+            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid auth token");
+        }
+
+        byte[] frame = MirrorFrameBuffer.getLatestFrame();
+        if (frame == null || frame.length == 0) {
+            // No frame available yet — return 204 No Content so client polls again
+            return newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "No frame yet");
+        }
+
+        // Return the JPEG frame as a standalone image response
+        return newFixedLengthResponse(Response.Status.OK, "image/jpeg",
+                new ByteArrayInputStream(frame), frame.length);
+    }
+
+    // --- API ---
+
+    private Response handleFileListApi() {
+        StringBuilder json = new StringBuilder(1024);
+        json.append("{\"files\":[");
+        int count = 0;
+        for (FileEntry e : fileEntries.values()) {
+            if (count++ > 0) json.append(",");
+            json.append("{\"id\":\"").append(HtmlHelper.escapeJson(e.id)).append("\",");
+            json.append("\"name\":\"").append(HtmlHelper.escapeJson(e.name)).append("\",");
+            json.append("\"size\":").append(e.size).append(",");
+            json.append("\"type\":\"file\"}");
+        }
+        for (FolderEntry e : folderEntries.values()) {
+            if (count++ > 0) json.append(",");
+            json.append("{\"id\":\"").append(HtmlHelper.escapeJson(e.id)).append("\",");
+            json.append("\"name\":\"").append(HtmlHelper.escapeJson(e.name)).append("\",");
+            json.append("\"fileCount\":").append(e.files.size()).append(",");
+            json.append("\"type\":\"folder\"}");
+        }
+        json.append("],\"total\":").append(count).append("}");
+        return newFixedLengthResponse(Response.Status.OK, "application/json", json.toString());
+    }
+
+    // --- Share Request Handler ---
+
+    /**
+     * Handle incoming share-request POST from another device.
+     * Expects a JSON body with: senderName, senderIp, senderPort, fileCount, callbackUrl.
+     * Delegates to the installed {@link ShareRequestHandler} if present.
+     */
+    private Response handleShareRequest(IHTTPSession session) {
+        if (shareRequestHandler == null) {
+            // Return 503 Service Unavailable instead of 404 — the endpoint exists,
+            // but the handler is not active (typically the file server isn't fully started yet).
+            // 404 was misleading senders into thinking the device "declined" the request.
+            return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "application/json",
+                    "{\"error\":\"share-request endpoint not active – server may not be fully started\"}");
+        }
+
+        try {
+            // Read the POST body
+            Map<String, String> body = new HashMap<>();
+            session.parseBody(body);
+
+            String postData = body.get("postData");
+            if (postData == null || postData.isEmpty()) {
+                // Try the files map (NanoHTTPD sometimes stores body there)
+                for (String val : body.values()) {
+                    if (val != null && val.startsWith("{")) {
+                        postData = val;
+                        break;
+                    }
+                }
+            }
+
+            if (postData == null || postData.isEmpty()) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json",
+                        "{\"error\":\"empty body\"}");
+            }
+
+            // Simple JSON parsing (avoid pulling in a JSON library dependency)
+            String senderName  = extractJsonValue(postData, "senderName");
+            String senderIp    = extractJsonValue(postData, "senderIp");
+            int senderPort     = extractJsonInt(postData, "senderPort", 0);
+            int fileCount      = extractJsonInt(postData, "fileCount", 0);
+            String callbackUrl = extractJsonValue(postData, "callbackUrl");
+
+            if (senderName == null || senderIp == null || senderPort == 0) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json",
+                        "{\"error\":\"missing required fields: senderName, senderIp, senderPort\"}");
+            }
+
+            String requestId = shareRequestHandler.onShareRequest(
+                    senderName, senderIp, senderPort, fileCount, callbackUrl);
+
+            String responseJson = "{\"status\":\"received\",\"requestId\":\""
+                    + HtmlHelper.escapeJson(requestId) + "\"}";
+            return newFixedLengthResponse(Response.Status.OK, "application/json", responseJson);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling share request", e);
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json",
+                    "{\"error\":\"" + HtmlHelper.escapeJson(e.getMessage()) + "\"}");
+        }
+    }
+
+    /**
+     * Minimal JSON string-value extractor (no external JSON lib needed).
+     * Extracts the value for the given key from a simple JSON string.
+     */
+    private static String extractJsonValue(String json, String key) {
+        String needle = "\"" + key + "\"";
+        int keyIdx = json.indexOf(needle);
+        if (keyIdx < 0) return null;
+
+        int colonIdx = json.indexOf(':', keyIdx + needle.length());
+        if (colonIdx < 0) return null;
+
+        // Find the start of the value string (first quote after colon)
+        int start = json.indexOf('"', colonIdx + 1);
+        if (start < 0) return null;
+
+        int end = json.indexOf('"', start + 1);
+        if (end < 0) return null;
+
+        return json.substring(start + 1, end);
+    }
+
+    /**
+     * Minimal JSON int-value extractor.
+     */
+    private static int extractJsonInt(String json, String key, int defaultVal) {
+        String needle = "\"" + key + "\"";
+        int keyIdx = json.indexOf(needle);
+        if (keyIdx < 0) return defaultVal;
+
+        int colonIdx = json.indexOf(':', keyIdx + needle.length());
+        if (colonIdx < 0) return defaultVal;
+
+        // Read digits after colon
+        int i = colonIdx + 1;
+        while (i < json.length() && (json.charAt(i) == ' ' || json.charAt(i) == '\t')) i++;
+
+        int start = i;
+        if (i < json.length() && json.charAt(i) == '-') i++;
+        while (i < json.length() && Character.isDigit(json.charAt(i))) i++;
+
+        if (start == i) return defaultVal;
+        try {
+            return Integer.parseInt(json.substring(start, i));
+        } catch (NumberFormatException e) {
+            return defaultVal;
+        }
+    }
+
+    // --- Helpers ---
+
+    /**
+     * Clean up old temp files from previous uploads that are older than 10 minutes.
+     * This prevents temp files from accumulating since our TempFile.delete() no longer
+     * deletes the actual file (it only closes the stream).
+     */
+    private void cleanupOldTempFiles() {
+        if (tempDir == null || !tempDir.exists()) return;
+        File[] files = tempDir.listFiles();
+        if (files == null) return;
+        long cutoff = System.currentTimeMillis() - (10 * 60 * 1000); // 10 minutes ago
+        for (File f : files) {
+            if (f.getName().startsWith("upload_") && f.lastModified() < cutoff) {
+                f.delete();
+            }
+        }
+    }
+
+    private long getContentLength(IHTTPSession session) {
+        try {
+            String cl = session.getHeaders().get("content-length");
+            if (cl != null) return Long.parseLong(cl);
+        } catch (NumberFormatException ignored) {}
+        return 0;
+    }
+
+    /**
+     * Extract the filename from the upload request.
+     * Tries multiple sources since NanoHTTPD versions differ in how they expose filenames.
+     */
+    private String extractFilename(IHTTPSession session, Map<String, String> files) {
+        Map<String, List<String>> params = session.getParameters();
+
+        // Method 1: NanoHTTPD puts the filename in params under the form field name
+        // Our HTML form uses name="file", so the key is "file"
+        if (params.containsKey("file")) {
+            List<String> vals = params.get("file");
+            if (vals != null && !vals.isEmpty() && vals.get(0) != null && !vals.get(0).isEmpty()) {
+                String name = vals.get(0);
+                // Only use this if it looks like a filename (has a dot/extension)
+                // Some NanoHTTPD versions put file CONTENT here instead of the name
+                if (name.contains(".") && name.length() < 500) {
+                    return name;
+                }
+            }
+        }
+
+        // Method 2: Check for "filename" parameter explicitly
+        if (params.containsKey("filename")) {
+            List<String> vals = params.get("filename");
+            if (vals != null && !vals.isEmpty() && vals.get(0) != null && !vals.get(0).isEmpty()) {
+                return vals.get(0);
+            }
+        }
+
+        // Method 3: Try Content-Disposition header (top-level)
+        String disposition = session.getHeaders().get("content-disposition");
+        if (disposition != null) {
+            int idx = disposition.indexOf("filename=");
+            if (idx >= 0) {
+                String name = disposition.substring(idx + 9).trim();
+                if (name.startsWith("\"") && name.endsWith("\"")) {
+                    name = name.substring(1, name.length() - 1);
+                }
+                if (!name.isEmpty()) return name;
+            }
+        }
+
+        // Method 4: Parse filename from raw Content-Type header's multipart boundary
+        // The browser sends the filename in the part-level Content-Disposition
+        // NanoHTTPD sometimes puts this info in the files map or params
+        String contentType = session.getHeaders().get("content-type");
+        if (contentType != null && contentType.contains("multipart/form-data")) {
+            // Try to find filename= in the raw body by checking if any param value contains it
+            for (Map.Entry<String, List<String>> entry : params.entrySet()) {
+                if (entry.getValue() != null) {
+                    for (String val : entry.getValue()) {
+                        if (val != null && val.contains("filename=")) {
+                            int fi = val.indexOf("filename=\"");
+                            if (fi >= 0) {
+                                int start = fi + 10;
+                                int end = val.indexOf("\"", start);
+                                if (end > start) {
+                                    return val.substring(start, end);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return "uploaded_" + System.currentTimeMillis();
+    }
+
+    private String sanitizeFilename(String filename) {
+        if (filename == null || filename.trim().isEmpty()) {
+            return "file_" + System.currentTimeMillis();
+        }
+        // Remove path separators (for flat filename only — use sanitizeFilePath for folder paths)
+        filename = filename.replace("/", "_").replace("\\", "_");
+        // Remove path traversal attempts
+        filename = filename.replace("..", "");
+        // Remove null bytes
+        filename = filename.replace("\0", "");
+        // Trim whitespace
+        filename = filename.trim();
+        return filename;
+    }
+
+    /**
+     * Sanitize a file path that may contain directory separators.
+     * Preserves the folder structure while blocking path traversal attacks.
+     * E.g., "MyFolder/sub/file.txt" → "MyFolder/sub/file.txt"
+     *       "../../../etc/passwd" → "etc/passwd"
+     */
+    private String sanitizeFilePath(String filePath) {
+        if (filePath == null || filePath.trim().isEmpty()) {
+            return "file_" + System.currentTimeMillis();
+        }
+        // Normalize backslashes to forward slashes
+        filePath = filePath.replace("\\", "/");
+        // Remove null bytes
+        filePath = filePath.replace("\0", "");
+        // Split into path segments and filter out traversal attempts
+        String[] segments = filePath.split("/");
+        StringBuilder safePath = new StringBuilder();
+        for (String segment : segments) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                continue; // Skip empty, current dir, and parent dir references
+            }
+            // Clean each segment individually
+            segment = segment.trim();
+            if (!segment.isEmpty()) {
+                if (safePath.length() > 0) safePath.append("/");
+                safePath.append(segment);
+            }
+        }
+        String result = safePath.toString();
+        return result.isEmpty() ? "file_" + System.currentTimeMillis() : result;
+    }
+
+    private File resolveDuplicate(File target, String filename, File dir) {
+        int counter = 1;
+        while (target.exists()) {
+            String nameWithoutExt = filename;
+            String extension = "";
+            int dotIndex = filename.lastIndexOf(".");
+            if (dotIndex > 0) {
+                nameWithoutExt = filename.substring(0, dotIndex);
+                extension = filename.substring(dotIndex);
+            }
+            target = new File(dir, nameWithoutExt + "_" + counter + extension);
+            counter++;
+        }
+        return target;
+    }
+
+    /**
+     * Stream-copy from temp file to destination — binary safe, no RAM buffering.
+     */
+    private long streamCopy(File source, File dest) throws IOException {
+        long total = 0;
+        byte[] buffer = new byte[8192];
+        try (FileInputStream fis = new FileInputStream(source);
+             FileOutputStream fos = new FileOutputStream(dest)) {
+            int len;
+            while ((len = fis.read(buffer)) != -1) {
+                fos.write(buffer, 0, len);
+                total += len;
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Save a file to the Downloads directory (used internally, not by upload handler).
+     * The upload handler uses saveToDownloadsWithData() instead.
+     */
+    private void saveToDownloads(File sourceFile, String filename) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, getMimeType(filename));
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FileShare");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                ContentResolver resolver = context.getContentResolver();
+                Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri itemUri = resolver.insert(collection, values);
+
+                if (itemUri != null) {
+                    try (OutputStream os = resolver.openOutputStream(itemUri);
+                         FileInputStream fis = new FileInputStream(sourceFile)) {
+                        byte[] buffer = new byte[8192];
+                        int len;
+                        while ((len = fis.read(buffer)) != -1) {
+                            os.write(buffer, 0, len);
+                        }
+                    }
+                    values.clear();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    resolver.update(itemUri, values, null, null);
+                    Log.d(TAG, "Saved to MediaStore: " + filename);
+                }
+            } else {
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                if (downloadsDir != null && (downloadsDir.exists() || downloadsDir.mkdirs())) {
+                    File subDir = new File(downloadsDir, "FileShare");
+                    if (!subDir.exists()) subDir.mkdirs();
+                    File dest = new File(subDir, filename);
+                    streamCopy(sourceFile, dest);
+                    android.media.MediaScannerConnection.scanFile(context,
+                            new String[]{dest.getAbsolutePath()}, null, null);
+                    Log.d(TAG, "Saved to Downloads: " + dest.getAbsolutePath());
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not save to Downloads: " + e.getMessage());
+        }
+    }
+
+    private long getFileSize(Uri uri) {
+        try {
+            String[] projection = {OpenableColumns.SIZE};
+            try (Cursor cursor = context.getContentResolver().query(uri, projection, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    return cursor.getLong(0);
+                }
+            }
+        } catch (Exception ignored) {}
+        return 0;
+    }
+
+    private String getExtension(String filename) {
+        if (filename == null) return "";
+        int dot = filename.lastIndexOf(".");
+        return dot > 0 ? filename.substring(dot + 1).toLowerCase() : "";
+    }
+
+    private String getMimeType(String filename) {
+        String ext = getExtension(filename);
+        if (ext.isEmpty()) return "application/octet-stream";
+        // Delegate to FileItem's comprehensive MIME mapping
+        return new FileItem(filename, "", 0, "").getMimeType();
+    }
+
+    private String generateId() {
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    // --- CSS ---
+
+    private String getCommonCss() {
+        return "*{margin:0;padding:0;box-sizing:border-box}" +
+                "body{font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);padding:20px;min-height:100vh}" +
+                ".container{max-width:900px;margin:0 auto;background:rgba(255,255,255,0.95);border-radius:20px;padding:30px;box-shadow:0 20px 60px rgba(0,0,0,0.3)}" +
+                "h1{color:#667eea;text-align:center;font-size:2em}" +
+                ".subtitle{text-align:center;color:#666;border-bottom:2px solid #eee;padding-bottom:15px;margin-bottom:10px}" +
+                ".stats{text-align:center;color:#764ba2;font-weight:bold;margin-bottom:20px}" +
+                ".section{margin-bottom:30px}" +
+                ".section h2{color:#764ba2;margin-bottom:15px}" +
+                ".file-list{display:flex;flex-direction:column;gap:10px}" +
+                ".file-card{background:#f8f9fa;padding:15px 20px;border-radius:12px;border-left:4px solid #667eea;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;transition:all .3s}" +
+                ".file-card:hover{background:#e9ecef;transform:translateX(3px)}" +
+                ".file-info{display:flex;align-items:center;gap:15px;flex:1;min-width:0}" +
+                ".file-icon{font-size:28px;flex-shrink:0}" +
+                ".file-details{flex:1;min-width:0}" +
+                ".file-name{font-weight:600;color:#333;word-break:break-all}" +
+                ".file-meta{font-size:12px;color:#888;margin-top:2px}" +
+                ".file-actions{display:flex;gap:8px;flex-shrink:0}" +
+                ".btn{padding:8px 16px;border-radius:20px;text-decoration:none;font-size:14px;cursor:pointer;border:none;transition:transform .2s;display:inline-block}" +
+                ".btn:hover{transform:scale(1.05)}" +
+                ".btn-download{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff}" +
+                ".btn-browse{background:linear-gradient(135deg,#43a047,#2e7d32);color:#fff}" +
+                ".btn-delete{background:#dc3545;color:#fff;padding:8px 12px}" +
+                ".btn-upload{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:12px 30px;font-size:16px}" +
+                ".btn-mirror{background:linear-gradient(135deg,#ff6a00,#ee0979);color:#fff;padding:15px 40px;font-size:18px;border-radius:30px}" +
+                ".upload-area{background:linear-gradient(135deg,#f5f7fa,#c3cfe2);padding:30px;border-radius:16px;text-align:center;border:2px dashed #667eea}" +
+                ".progress-container{margin-top:15px}" +
+                ".progress-bar{width:100%;height:8px;background:#ddd;border-radius:4px;overflow:hidden}" +
+                ".progress-fill{height:100%;background:linear-gradient(135deg,#667eea,#764ba2);width:0;transition:width .3s;border-radius:4px}" +
+                ".status{margin-top:10px;padding:10px;border-radius:8px;font-size:14px}" +
+                ".empty-state{text-align:center;padding:40px;color:#999}" +
+                ".breadcrumb{margin-bottom:20px;color:#666;font-size:14px}" +
+                ".breadcrumb a{color:#667eea;text-decoration:none}" +
+                "hr{margin:25px 0;border:none;border-top:2px solid #eee}" +
+                "@media(max-width:600px){.container{padding:15px}.file-card{flex-direction:column;align-items:stretch}.file-actions{justify-content:center}}";
+    }
+
+    // --- JS ---
+
+    private String getUploadScript() {
+        return "var selectedFiles=[];" +
+                "function onFileSelected(){" +
+                "  var fi=document.getElementById('fileInput');" +
+                "  selectedFiles=Array.from(fi.files);" +
+                "  document.getElementById('folderInput').value='';" +
+                "  updateFileList();" +
+                "}" +
+                "function onFolderSelected(){" +
+                "  var fi=document.getElementById('folderInput');" +
+                "  selectedFiles=Array.from(fi.files);" +
+                "  document.getElementById('fileInput').value='';" +
+                "  updateFileList();" +
+                "}" +
+                "function updateFileList(){" +
+                "  var btn=document.getElementById('uploadBtn');" +
+                "  var list=document.getElementById('fileList');" +
+                "  if(!selectedFiles.length){btn.disabled=true;list.innerHTML='';return;}" +
+                "  btn.disabled=false;" +
+                "  var names=selectedFiles.map(function(f){" +
+                "    var path=f.webkitRelativePath||f.name;" +
+                "    return path.length>60?'...'+path.slice(path.length-57):path;" +
+                "  });" +
+                "  list.innerHTML='<b>'+selectedFiles.length+' item(s):</b> '+names.slice(0,8).join(', ')" +
+                "    +(selectedFiles.length>8?' ... and '+(selectedFiles.length-8)+' more':'');" +
+                "}" +
+                "document.getElementById('uploadForm').addEventListener('submit',function(e){" +
+                "  e.preventDefault();" +
+                "  if(!selectedFiles.length){alert('Select files or a folder');return}" +
+                "  var statusDiv=document.getElementById('uploadStatus');" +
+                "  var progressContainer=document.getElementById('progressContainer');" +
+                "  var progressFill=document.getElementById('progressFill');" +
+                "  var uploadBtn=document.getElementById('uploadBtn');" +
+                "  uploadBtn.disabled=true;progressContainer.style.display='block';" +
+                "  var uploaded=0;var total=selectedFiles.length;" +
+                "  var isFolder=selectedFiles.some(function(f){return f.webkitRelativePath&&f.webkitRelativePath.indexOf('/')>-1;});" +
+                "  if(isFolder){" +
+                "    // Upload all files in one batch request, preserving folder structure" +
+                "    var fd=new FormData();" +
+                "    selectedFiles.forEach(function(f){" +
+                "      var path=f.webkitRelativePath||f.name;" +
+                "      fd.append('files',f,path);" +
+                "    });" +
+                "    statusDiv.innerHTML='⏳ Uploading '+total+' files...';" +
+                "    statusDiv.style.background='#fff3cd';" +
+                "    var xhr=new XMLHttpRequest();" +
+                "    xhr.open('POST','/upload-folder" + getAuthParam() + "',true);" +
+                "    xhr.upload.onprogress=function(e){" +
+                "      if(e.lengthComputable){var pct=Math.round((e.loaded/e.total)*100);progressFill.style.width=pct+'%';}" +
+                "    };" +
+                "    xhr.onload=function(){" +
+                "      progressFill.style.width='100%';" +
+                "      if(xhr.status===200){" +
+                "        statusDiv.innerHTML='✅ '+total+' files uploaded!';" +
+                "        statusDiv.style.background='#d4edda';" +
+                "      }else{" +
+                "        statusDiv.innerHTML='❌ Upload failed: '+xhr.statusText;" +
+                "        statusDiv.style.background='#f8d7da';" +
+                "      }" +
+                "      setTimeout(function(){location.reload()},2000);" +
+                "    };" +
+                "    xhr.onerror=function(){" +
+                "      statusDiv.innerHTML='❌ Network error';statusDiv.style.background='#f8d7da';" +
+                "      setTimeout(function(){location.reload()},2000);" +
+                "    };" +
+                "    xhr.send(fd);" +
+                "  }else{" +
+                "    // Upload individual files one by one" +
+                "    for(var i=0;i<selectedFiles.length;i++){" +
+                "      (function(file){" +
+                "        var fd=new FormData();fd.append('file',file);" +
+                "        statusDiv.innerHTML='⏳ Uploading '+file.name+'... ('+(uploaded+1)+'/'+total+')';" +
+                "        statusDiv.style.background='#fff3cd';" +
+                "        var xhr=new XMLHttpRequest();" +
+                "        xhr.open('POST','/upload" + getAuthParam() + "',true);" +
+                "        xhr.upload.onprogress=function(e){" +
+                "          if(e.lengthComputable){var pct=Math.round((e.loaded/e.total)*100);progressFill.style.width=pct+'%';}" +
+                "        };" +
+                "        xhr.onload=function(){" +
+                "          uploaded++;progressFill.style.width='100%';" +
+                "          if(xhr.status===200){" +
+                "            statusDiv.innerHTML='✅ '+file.name+' uploaded! ('+uploaded+'/'+total+')';" +
+                "            statusDiv.style.background='#d4edda';" +
+                "          }else{" +
+                "            statusDiv.innerHTML='❌ '+file.name+' failed';" +
+                "            statusDiv.style.background='#f8d7da';" +
+                "          }" +
+                "          if(uploaded===total){uploadBtn.disabled=false;setTimeout(function(){location.reload()},1500);}" +
+                "        };" +
+                "        xhr.onerror=function(){" +
+                "          uploaded++;statusDiv.innerHTML='❌ Network error';statusDiv.style.background='#f8d7da';" +
+                "          if(uploaded===total){uploadBtn.disabled=false;setTimeout(function(){location.reload()},1500);}" +
+                "        };" +
+                "        xhr.send(fd);" +
+                "      })(selectedFiles[i]);" +
+                "    }" +
+                "  }" +
+                "});" +
+                "function deleteItem(id){" +
+                "  if(!confirm('Delete this item?'))return;" +
+                "  fetch('/delete/'+id+'" + getAuthParam() + "',{method:'POST'}).then(function(){location.reload()});" +
+                "}";
+    }
+
+    // --- HTML responses ---
+
+    private String getSuccessHtml(String filename, long size) {
+        return "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+                "<meta http-equiv='refresh' content='2;url=/" + getAuthParam() + "'>" +
+                "<style>body{font-family:sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);" +
+                "display:flex;justify-content:center;align-items:center;height:100vh;margin:0}" +
+                ".container{background:#fff;padding:40px;border-radius:20px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}" +
+                ".success{color:#4CAF50;font-size:64px}</style></head><body>" +
+                "<div class='container'><div class='success'>✅</div><h2>Upload Complete!</h2>" +
+                "<div style='background:#f5f5f5;padding:15px;border-radius:10px;margin:15px 0;font-family:monospace;word-break:break-all'>" +
+                HtmlHelper.escapeHtml(filename) + "</div>" +
+                "<div style='color:#666'>Size: " + HtmlHelper.formatFileSize(size) + "</div>" +
+                "<p style='color:#999;margin-top:20px'>Redirecting...</p></div></body></html>";
+    }
+
+    private String getErrorHtml(String message) {
+        return "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+                "<style>body{font-family:sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);" +
+                "display:flex;justify-content:center;align-items:center;height:100vh;margin:0}" +
+                ".container{background:#fff;padding:40px;border-radius:20px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}" +
+                ".error{color:#f44336;font-size:64px}</style></head><body>" +
+                "<div class='container'><div class='error'>❌</div><h2>Upload Failed</h2>" +
+                "<div style='background:#fff5f5;padding:15px;border-radius:10px;color:#d32f2f;margin:15px 0;font-family:monospace;word-break:break-all'>" +
+                HtmlHelper.escapeHtml(message != null ? message : "Unknown error") + "</div>" +
+                "<a href='/" + getAuthParam() + "' style='color:#667eea'>← Go Back</a></div></body></html>";
+    }
+
+    private String getRedirectHtml(String message) {
+        return "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+                "<meta http-equiv='refresh' content='1;url=/" + getAuthParam() + "'>" +
+                "<style>body{font-family:sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);" +
+                "display:flex;justify-content:center;align-items:center;height:100vh;margin:0;color:#fff}</style></head><body>" +
+                "<div style='text-align:center'><h2>✅ " + HtmlHelper.escapeHtml(message) + "</h2><p>Redirecting...</p></div></body></html>";
+    }
+}

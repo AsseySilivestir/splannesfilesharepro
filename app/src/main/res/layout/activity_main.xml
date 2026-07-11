@@ -1,0 +1,550 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <!-- ============================== -->
+        <!-- HEADER                         -->
+        <!-- ============================== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="20dp">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Splannes"
+                    android:textSize="28sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:letterSpacing="-0.02" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="File Share Pro"
+                    android:textSize="14sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginTop="2dp" />
+
+            </LinearLayout>
+
+            <!-- Auth Token Badge -->
+            <LinearLayout
+                android:id="@+id/layout_auth_token"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:background="@drawable/file_icon_bg"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="6dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="🔑"
+                    android:textSize="14sp"
+                    android:layout_marginEnd="6dp" />
+
+                <TextView
+                    android:id="@+id/tv_auth_token"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="------"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/primary"
+                    android:fontFamily="monospace" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+        <!-- ============================== -->
+        <!-- SERVER STATUS CARD             -->
+        <!-- ============================== -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_server_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="2dp"
+            app:strokeWidth="1dp"
+            app:strokeColor="@color/primary_light"
+            app:cardBackgroundColor="@color/surface"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <!-- Status Header Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="12dp">
+
+                    <View
+                        android:id="@+id/indicator_status"
+                        android:layout_width="10dp"
+                        android:layout_height="10dp"
+                        android:background="@drawable/status_dot_off"
+                        android:layout_marginEnd="10dp" />
+
+                    <TextView
+                        android:id="@+id/tv_connection_status"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Server not running"
+                        android:textSize="15sp"
+                        android:textColor="@color/text_secondary" />
+
+                </LinearLayout>
+
+                <!-- Server URL (visible when running) -->
+                <TextView
+                    android:id="@+id/tv_server_url"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textSize="14sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/primary"
+                    android:background="@color/primary_light"
+                    android:padding="14dp"
+                    android:visibility="gone"
+                    android:drawableStart="@android:drawable/ic_menu_share"
+                    android:drawablePadding="8dp" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============================== -->
+        <!-- ACTIONS CARD                   -->
+        <!-- ============================== -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/surface"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <TextView
+                    android:text="Share"
+                    android:textSize="18sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:layout_marginBottom="16dp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+
+                <!-- Row 1: Pick Images + Pick Files -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="10dp">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_select_images"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="6dp"
+                        android:text="🖼 Images"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_select_files"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="📂 Files"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                </LinearLayout>
+
+                <!-- Row 2: Select Folder + Image to PDF -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="10dp">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_select_folder"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="6dp"
+                        android:text="📁 Folder"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_image_to_pdf"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="🖼 To PDF"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                </LinearLayout>
+
+                <!-- Row 3: Text to PDF + Discover Devices (NEW) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="10dp">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_text_to_pdf"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="6dp"
+                        android:text="📝 Text→PDF"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_discover_devices"
+                        android:layout_width="0dp"
+                        android:layout_height="52dp"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="📡 Devices"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        app:cornerRadius="14dp"
+                        app:iconGravity="textStart"
+                        app:backgroundTint="#E8F5E9"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                </LinearLayout>
+
+                <!-- Divider -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="@color/primary_light"
+                    android:layout_marginVertical="8dp" />
+
+                <!-- Start Server — Full width, prominent -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_start_server"
+                    android:layout_width="match_parent"
+                    android:layout_height="56dp"
+                    android:layout_marginTop="4dp"
+                    android:text="🌐 Start Sharing"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    app:cornerRadius="14dp"
+                    style="@style/Widget.Material3.Button" />
+
+                <!-- Screen Mirror — Full width, prominent -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_start_mirror"
+                    android:layout_width="match_parent"
+                    android:layout_height="56dp"
+                    android:layout_marginTop="10dp"
+                    android:text="🖥️ Screen Mirror"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    app:cornerRadius="14dp"
+                    app:backgroundTint="@color/mirror_button"
+                    style="@style/Widget.Material3.Button" />
+
+                <!-- Hotspot Guide — Outlined, subtle -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_hotspot_guide"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginTop="10dp"
+                    android:text="📶 Hotspot Guide"
+                    android:textSize="13sp"
+                    app:cornerRadius="14dp"
+                    style="@style/Widget.Material3.Button.OutlinedButton" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============================== -->
+        <!-- DEVICE DISCOVERY CARD (NEW)    -->
+        <!-- ============================== -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_devices"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/surface"
+            android:layout_marginBottom="16dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <!-- Header -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="12dp">
+
+                    <TextView
+                        android:text="📡 Nearby Devices"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary"
+                        android:layout_weight="1"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_send_to_devices"
+                        android:layout_width="wrap_content"
+                        android:layout_height="40dp"
+                        android:text="Send"
+                        android:textSize="12sp"
+                        android:enabled="false"
+                        android:alpha="0.5"
+                        app:cornerRadius="10dp"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Tap a device to share your files. They'll get a prompt to allow/deny."
+                    android:textSize="12sp"
+                    android:textColor="@color/text_secondary"
+                    android:layout_marginBottom="10dp" />
+
+                <!-- Device List -->
+                <ListView
+                    android:id="@+id/list_view_devices"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:maxHeight="180dp"
+                    android:scrollbars="vertical" />
+
+                <LinearLayout
+                    android:id="@+id/layout_device_buttons"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="8dp">
+
+                </LinearLayout>
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============================== -->
+        <!-- SHARED & RECEIVED FILES CARD   -->
+        <!-- ============================== -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_files"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/surface"
+            android:layout_marginBottom="16dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <!-- Header Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="14dp">
+
+                    <TextView
+                        android:text="📁 Shared &amp; Received"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary"
+                        android:layout_weight="1"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/tv_file_count"
+                        android:text="0 files"
+                        android:textSize="12sp"
+                        android:textColor="@color/primary"
+                        android:background="@drawable/file_icon_bg"
+                        android:paddingHorizontal="10dp"
+                        android:paddingVertical="4dp"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content" />
+
+                </LinearLayout>
+
+                <!-- Empty State -->
+                <LinearLayout
+                    android:id="@+id/empty_state"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:gravity="center"
+                    android:paddingVertical="28dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="📭"
+                        android:textSize="44sp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="No files yet"
+                        android:textSize="14sp"
+                        android:textColor="@color/text_disabled"
+                        android:layout_marginTop="8dp" />
+
+                </LinearLayout>
+
+                <!-- File List -->
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/recycler_view_files"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:nestedScrollingEnabled="false"
+                    android:visibility="gone"
+                    android:overScrollMode="never" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============================== -->
+        <!-- QR CODE CARD                   -->
+        <!-- ============================== -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_qr"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/surface"
+            android:layout_marginBottom="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:gravity="center_horizontal"
+                android:padding="24dp">
+
+                <TextView
+                    android:text="📱 Scan to Connect"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/text_primary"
+                    android:layout_marginBottom="16dp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+
+                <ImageView
+                    android:id="@+id/iv_qr"
+                    android:layout_width="200dp"
+                    android:layout_height="200dp"
+                    android:scaleType="fitCenter"
+                    android:background="@drawable/qr_background"
+                    android:contentDescription="QR code for server URL" />
+
+                <TextView
+                    android:id="@+id/tv_qr_hint"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Scan with any device on the same network"
+                    android:textSize="12sp"
+                    android:textColor="@color/text_disabled"
+                    android:layout_marginTop="12dp" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- ============================== -->
+        <!-- FOOTER                         -->
+        <!-- ============================== -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="8dp"
+            android:text="Splannes • Local WiFi File Sharing"
+            android:textSize="11sp"
+            android:textColor="@color/text_disabled"
+            android:alpha="0.7" />
+
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>

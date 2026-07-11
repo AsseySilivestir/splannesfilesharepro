@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Store uploaded files in app's private storage -->
+    <files-path
+        name="shared_files"
+        path="shared_files/" />
+
+    <!-- Allow access to cache directory -->
+    <cache-path
+        name="cache"
+        path="/" />
+
+    <!-- Allow access to external files (for compatibility) -->
+    <external-files-path
+        name="external_files"
+        path="." />
+
+    <!-- Allow access to downloads folder (for Android 10 and below) -->
+    <external-path
+        name="external"
+        path="." />
+
+    <!-- Allow access to downloads folder specifically -->
+    <external-path
+        name="downloads"
+        path="Download/" />
+</paths>

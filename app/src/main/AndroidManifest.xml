@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.splannes.fileshares">
+
+    <!-- Network Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Location (Required for WiFi/Hotspot scanning on older devices) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Notifications (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Foreground Service Permissions (Android 14+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Storage Permissions (Scoped Storage Logic) -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+
+    <!-- Media Permissions (Android 13+) -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"
+        tools:targetApi="33" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"
+        tools:targetApi="33" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"
+        tools:targetApi="33" />
+
+    <application
+        android:allowBackup="true"
+        android:label="Splannes File Share"
+        android:theme="@style/Theme.Material3.DayNight.NoActionBar"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        tools:targetApi="34">
+
+        <!-- File Provider for sharing uploaded files -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/fileprovider" />
+        </provider>
+
+        <!-- File Server Service -->
+        <service
+            android:name="com.splannes.fileshares.FileServerService"
+            android:enabled="true"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Main Launcher Activity -->
+        <activity
+            android:name="com.splannes.fileshares.MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>
